@@ -1,0 +1,205 @@
+import type { EngineId } from "../db/schema";
+import { chatModelCatalog } from "../chat/models";
+import { chatModel } from "../chat/stream";
+import { freeModelLane, isAllowedFreeModel } from "./free-model-lane";
+import { openCodeZenModelId } from "../provider-gateway/provider";
+import { modelOfferedToUser } from "../provider-gateway/provider-accounts";
+
+export const KIMI_K3_MODEL = "moonshotai/kimi-k3";
+export const DEEPSEEK_V4_FLASH_MODEL = "deepseek/deepseek-v4-flash";
+export const GEMINI_FLASH_MODEL = "google/gemini-3.7-flash";
+export const FAST_OPENCODE_MODEL = "openai/gpt-5.6-luna";
+export const FAST_CODEX_MODEL = "gpt-5.6-luna";
+export const CEREBRAS_QWEN_MODEL = "cerebras/qwen-3.8-27b";
+/** Kept for durable runs created before the picker moved to Qwen 3.8. */
+export const CEREBRAS_GEMMA_MODEL = "cerebras/gemma-4-31b";
+export const CODEX_ALLOWED_MODELS = [
+  FAST_CODEX_MODEL,
+  "gpt-5.6-terra",
+  "gpt-5.6-sol",
+  "gpt-6-astra",
+] as const;
+
+/** Models that the OpenCode picker and provider gateway are allowed to spend. */
+export const OPENCODE_ALLOWED_MODELS = {
+  anthropic: [
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-haiku-4-5",
+  ],
+  openai: [
+    "openai/gpt-5.6-sol",
+    FAST_OPENCODE_MODEL,
+    "openai/gpt-5.6-terra",
+  ],
+  openrouter: [
+    KIMI_K3_MODEL,
+    DEEPSEEK_V4_FLASH_MODEL,
+    GEMINI_FLASH_MODEL,
+  ],
+  cerebras: [CEREBRAS_QWEN_MODEL],
+} as const;
+
+// The Free lane (OpenRouter ":free" variants, OpenCode only) is DYNAMIC. The
+// default path derives it from OpenRouter's public catalog with a TTL cache and
+// curated seed; the independent default-off registry-read flag consumes only a
+// durable qualified generation - see ./free-model-lane. Free slugs ride the same OpenRouter gateway
+// path as the paid ones, so a user's own connected OpenRouter key is spent when
+// present and the shared house key serves only where that fallback is allowed.
+
+const SHARED_SANDBOX_MODELS = [
+  ...OPENCODE_ALLOWED_MODELS.anthropic,
+  ...OPENCODE_ALLOWED_MODELS.openai,
+  ...OPENCODE_ALLOWED_MODELS.openrouter,
+];
+const OPENCODE_MODELS = new Set<string>([
+  ...SHARED_SANDBOX_MODELS,
+  ...OPENCODE_ALLOWED_MODELS.cerebras,
+]);
+const OPENCODE_PROVIDER_IDS = new Set<string>(Object.keys(OPENCODE_ALLOWED_MODELS));
+const SHARED_SANDBOX_MODEL_SET = new Set<string>(SHARED_SANDBOX_MODELS);
+const CLAUDE_MODELS = new Set<string>(OPENCODE_ALLOWED_MODELS.anthropic);
+const PERSISTED_OPENCODE_MODELS = new Set<string>([CEREBRAS_GEMMA_MODEL]);
+export const DEFAULT_OPENCODE_MODEL = FAST_OPENCODE_MODEL;
+export const DEFAULT_CLAUDE_MODEL = "claude-opus-5";
+export const DEFAULT_CODEX_MODEL = FAST_CODEX_MODEL;
+
+function codexModels(
+  env: Record<string, string | undefined> = process.env,
+): ReadonlySet<string> {
+  const configured = env.CODEX_ALLOWED_MODELS
+    ?.split(",")
+    .map((model) => model.trim())
+    .filter(Boolean);
+  return new Set(configured?.length ? configured : CODEX_ALLOWED_MODELS);
+}
+
+export function allowedModelsForEngine(
+  engine: EngineId,
+  env: Record<string, string | undefined> = process.env,
+): readonly string[] {
+  switch (engine) {
+    case "opencode":
+      return [...Object.values(OPENCODE_ALLOWED_MODELS).flat(), ...freeModelLane()];
+    case "daytona":
+    case "pi":
+      return SHARED_SANDBOX_MODELS;
+    case "claude":
+    case "claude-sdk":
+      return OPENCODE_ALLOWED_MODELS.anthropic;
+    case "codex":
+      return [...codexModels(env)];
+    case "chat":
+      return chatModelCatalog(env).models.map((model) => model.value);
+    case "mock":
+      return [];
+  }
+}
+
+/** Engine-owned default. */
+export function defaultModelForEngine(
+  engine: EngineId,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  switch (engine) {
+    case "opencode":
+    case "daytona":
+    case "pi":
+      return DEFAULT_OPENCODE_MODEL;
+    case "codex":
+      return codexModels(env).values().next().value ?? DEFAULT_CODEX_MODEL;
+    case "chat":
+      return chatModel(env);
+    case "mock":
+    case "claude":
+    case "claude-sdk":
+      return DEFAULT_CLAUDE_MODEL;
+  }
+}
+
+/** Fail-closed paid-model policy. Mock remains unconstrained for deterministic tests. */
+export function isModelAllowedForEngine(
+  engine: EngineId,
+  model: string,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (!model.trim()) return false;
+  switch (engine) {
+    case "mock":
+      return true;
+    case "opencode":
+      return OPENCODE_MODELS.has(model) || isAllowedFreeModel(model);
+    case "daytona":
+    case "pi":
+      return SHARED_SANDBOX_MODEL_SET.has(model);
+    case "claude":
+    case "claude-sdk":
+      return CLAUDE_MODELS.has(model);
+    case "codex":
+      return codexModels(env).has(model);
+    case "chat":
+      return chatModelCatalog(env).models.some((candidate) => candidate.value === model);
+  }
+}
+
+/**
+ * Revalidate an already-accepted durable run without making a catalog rotation
+ * turn it into a policy failure. New work still goes through
+ * `isModelAllowedForEngine`; this narrower replay seam accepts only
+ * provider-qualified OpenRouter free variants in addition to the current lane.
+ */
+export function isPersistedModelAllowedForEngine(
+  engine: EngineId,
+  model: string,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (engine === "opencode" && PERSISTED_OPENCODE_MODELS.has(model)) return true;
+  if (engine === "opencode" && model.includes("/") && model.endsWith(":free")) {
+    return true;
+  }
+  return isModelAllowedForEngine(engine, model, env);
+}
+
+/** Convert the product catalog id into the provider-qualified id T3/OpenCode expects. */
+export function openCodeRuntimeModelId(model: string): string {
+  const separator = model.indexOf("/");
+  if (separator === -1) return `anthropic/${model}`;
+
+  const provider = model.slice(0, separator);
+  if (OPENCODE_PROVIDER_IDS.has(provider)) return model;
+  if (!isPersistedModelAllowedForEngine("opencode", model)) {
+    throw new Error(`Unsupported OpenCode model provider: ${provider}`);
+  }
+  // Free-lane ids carry the ":free" marker. OpenRouter's runtime ids do too;
+  // OpenCode Zen's own ids do not.
+  return provider === "opencode"
+    ? `opencode/${openCodeZenModelId(model)}`
+    : `openrouter/${model}`;
+}
+
+/** A reply may inherit its durable parent's accepted model after a restart;
+ * explicit switches must still be present in the current catalog. Persisted
+ * policy also keeps retired curated models replayable after a catalog rotation. */
+export function isReplyModelAllowedForEngine(
+  engine: EngineId,
+  model: string,
+  parentModel: string | null,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return isModelAllowedForEngine(engine, model, env) ||
+    (model === parentModel && isPersistedModelAllowedForEngine(engine, model, env));
+}
+
+/** The reply policy for one account: a model whose provider PROVIDER_ACCOUNTS
+ *  withholds from this user is no model at all, inherited or asked for. */
+export async function replyModelAdmittedForUser(
+  engine: EngineId,
+  model: string,
+  parentModel: string | null,
+  userId: string | null | undefined,
+  env: Record<string, string | undefined> = process.env,
+): Promise<boolean> {
+  return isReplyModelAllowedForEngine(engine, model, parentModel, env) &&
+    (await modelOfferedToUser(engine, model, userId, env));
+}

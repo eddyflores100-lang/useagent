@@ -1,0 +1,52 @@
+---
+title: Operations
+description: Operate immutable Compose releases, verify engine and sandbox combinations, preserve invariants, and prepare recoverable backups.
+sidebar:
+  label: Overview
+  order: 1
+---
+
+Operations in UseAgent are built around one principle: a release must prove itself
+before it ships, and roll back cleanly if it cannot.
+
+<CardGroup cols={2}>
+  <Card title="Compose deployment" href="/operations/deployment" icon="rocket">
+    Immutable application images, the single-backend cutover, provider-neutral
+    configuration, and rollback evidence.
+  </Card>
+  <Card title="Verified support" href="/operations/verified-support" icon="badge-check">
+    Which engine and sandbox paths are implemented, ready, or currently proven.
+  </Card>
+  <Card title="Verification" href="/operations/verification" icon="check-check">
+    The test and parity arsenal, from isolated-database unit suites to real
+    engine journeys.
+  </Card>
+  <Card title="Invariants" href="/operations/invariants" icon="lock">
+    Single backend per database, write-only secrets, a restricted gateway role,
+    and immutable-source releases.
+  </Card>
+  <Card title="Backups and restore" href="/operations/backups" icon="archive">
+    A daily encrypted snapshot with verify and restore lanes, and the off-host
+    requirement.
+  </Card>
+</CardGroup>
+
+## The shape of a safe change
+
+<Steps>
+  <Step title="Type-check everything">
+    `bun run typecheck` covers the frontend, backend, and shared packages, and
+    must pass before a change is done.
+  </Step>
+  <Step title="Verify in isolation">
+    Suites run against a throwaway database so they never disturb a live one.
+  </Step>
+  <Step title="Certify exact combinations">
+    Live journeys name the engine, credential mode, model, sandbox provider,
+    runtime generation, and release fingerprint they prove.
+  </Step>
+  <Step title="Roll back on any failure">
+    Stop the candidate, restore the prior immutable image and environment,
+    verify health, then reopen admission.
+  </Step>
+</Steps>

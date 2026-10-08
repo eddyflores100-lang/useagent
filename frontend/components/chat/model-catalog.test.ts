@@ -1,0 +1,277 @@
+import { describe, expect, test } from "bun:test";
+import {
+  engineConfigFromCapabilityCatalog,
+  engineRuntimeCaption,
+  fallbackEnabledEngineConfig,
+  modelCatalogNotice,
+  reconcileSelectedModel,
+  resolveEnabledEngine,
+  unavailableModelOptions,
+} from "@/components/chat/engine-picker";
+import {
+  CEREBRAS_MODELS,
+  CHAT_MODELS,
+  CODEX_MODELS,
+  FREE_MODELS,
+  isFreeModel,
+  MODELS,
+  modelLabel,
+  modelOptionsForEngine,
+  partitionModelOptions,
+  selectableModelsForEngine,
+  supportsPreSessionModelSelection,
+} from "@/components/chat/types";
+import type { CapabilityCatalog } from "@/lib/capability-catalog";
+
+describe("engine model catalog", () => {
+  test("keeps conservative local OpenCode models when server readiness is unknown", () => {
+    const fallback = fallbackEnabledEngineConfig();
+    expect(fallback.engines).toEqual(["opencode"]);
+    // Before the manifest answers, a provider the server may offer to some
+    // accounts only is not listed; everything else is.
+    expect(fallback.models.opencode).toEqual(
+      selectableModelsForEngine("opencode")
+        .map((model) => model.value)
+        .filter((value) => !CEREBRAS_MODELS.some((model) => model.value === value)),
+    );
+    expect(fallback.readinessKnown).toBe(false);
+    expect(fallback.readiness).toEqual({});
+    expect(fallback.modelDetails).toEqual({});
+  });
+  test("reconciles a stale selection to the first engine the server actually enables", () => {
+    expect(resolveEnabledEngine("opencode", ["chat"])).toBe("chat");
+    expect(resolveEnabledEngine("chat", ["chat", "opencode"])).toBe("chat");
+    expect(resolveEnabledEngine("opencode", [])).toBeNull();
+  });
+
+  test("reconciles a removed reply model and blocks only when no replacement exists", () => {
+    expect(reconcileSelectedModel("removed", [{ value: "gpt-6-astra" }], true)).toEqual({
+      replacement: "gpt-6-astra",
+      blocked: false,
+    });
+    expect(reconcileSelectedModel("removed", [], true)).toEqual({
+      replacement: null,
+      blocked: true,
+    });
+    expect(reconcileSelectedModel("removed", [], false)).toEqual({
+      replacement: null,
+      blocked: false,
+    });
+  });
+
+  test("states when native availability is refreshing or stale", () => {
+    expect(modelCatalogNotice({
+      source: "policy",
+      stale: true,
+      error: "native_catalog_refreshing",
+    })).toBe("Refreshing availability for this account…");
+    expect(modelCatalogNotice({
+      source: "native",
+      stale: true,
+      error: "native_catalog_unavailable",
+    })).toBe("Model availability could not refresh. Showing the last known catalog.");
+    expect(modelCatalogNotice({ source: "native", stale: false })).toBeNull();
+  });
+
+  test("Codex picker uses backend-policy model ids, not OpenRouter ids", () => {
+    expect(CODEX_MODELS.map((m) => m.value)).toEqual([
+      "gpt-5.6-luna",
+      "gpt-5.6-terra",
+      "gpt-5.6-sol",
+      "gpt-6-astra",
+    ]);
+    expect(selectableModelsForEngine("codex").map((m) => m.value)).toEqual([
+      "gpt-5.6-luna",
+      "gpt-5.6-terra",
+      "gpt-5.6-sol",
+      "gpt-6-astra",
+    ]);
+    expect(selectableModelsForEngine("codex").some((m) => m.value.startsWith("openai/"))).toBe(
+      false,
+    );
+  });
+
+  test("OpenCode picker keeps provider-qualified model ids", () => {
+    expect(selectableModelsForEngine("opencode")).toEqual([
+      ...MODELS,
+      ...CEREBRAS_MODELS,
+      ...FREE_MODELS,
+    ]);
+    expect(selectableModelsForEngine("opencode")[0]?.value).toBe("openai/gpt-5.6-luna");
+    expect(selectableModelsForEngine("opencode").map((m) => m.value)).toContain(
+      "openai/gpt-5.6-luna",
+    );
+    expect(selectableModelsForEngine("opencode").map((m) => m.value)).not.toContain(
+      "openai/gpt-5.6-sol-pro",
+    );
+    expect(selectableModelsForEngine("opencode").map((m) => m.value)).toContain(
+      "deepseek/deepseek-v4-flash",
+    );
+    expect(
+      selectableModelsForEngine("opencode").find(
+        (model) => model.value === "deepseek/deepseek-v4-flash",
+      )?.label,
+    ).toBe("DeepSeek V4 Flash · Wafer Fast");
+    expect(selectableModelsForEngine("opencode").map((m) => m.value)).toContain(
+      "google/gemini-3.7-flash",
+    );
+    expect(selectableModelsForEngine("opencode").map((m) => m.value)).toContain(
+      "cerebras/qwen-3.8-27b",
+    );
+    expect(selectableModelsForEngine("opencode").map((m) => m.value)).not.toContain(
+      "cerebras/gemma-4-31b",
+    );
+    expect(modelLabel("cerebras/qwen-3.8-27b", "opencode")).toBe(
+      "Qwen 3.8 27B · Cerebras",
+    );
+  });
+
+  test("Free lane is OpenCode-only and grouped after the paid catalog", () => {
+    expect(FREE_MODELS.length).toBeGreaterThan(0);
+    for (const model of FREE_MODELS) {
+      expect(isFreeModel(model.value)).toBe(true);
+    }
+    expect(MODELS.some((model) => isFreeModel(model.value))).toBe(false);
+    const opencode = selectableModelsForEngine("opencode").map((m) => m.value);
+    expect(opencode).not.toContain("nvidia/nemotron-3-ultra-550b-a55b:free");
+    // Appended after the paid catalog so the default (first entry) stays paid.
+    expect(opencode.slice(MODELS.length + CEREBRAS_MODELS.length)).toEqual(
+      FREE_MODELS.map((m) => m.value),
+    );
+    for (const engine of ["pi", "codex", "chat"] as const) {
+      expect(selectableModelsForEngine(engine).some((m) => isFreeModel(m.value))).toBe(false);
+    }
+    expect(modelLabel("minimax/minimax-m3:free", "opencode")).toBe("MiniMax M3");
+  });
+
+  test("Free section membership is manifest-driven via the id suffix, not the seed list", () => {
+    // A backend manifest can advertise a free model the frontend has never
+    // heard of: it must land in the Free partition with its id as the label.
+    const options = modelOptionsForEngine("opencode", [
+      "openai/gpt-5.6-luna",
+      "newvendor/brand-new-model:free",
+    ]);
+    const { paid, free } = partitionModelOptions(options);
+    expect(paid.map((m) => m.value)).toEqual(["openai/gpt-5.6-luna"]);
+    expect(free.map((m) => m.value)).toEqual(["newvendor/brand-new-model:free"]);
+    expect(free[0]?.label).toBe("newvendor/brand-new-model:free");
+    // And a manifest that rotates a seed model OUT drops it from the picker.
+    const rotated = modelOptionsForEngine("opencode", ["openai/gpt-5.6-luna"]);
+    expect(partitionModelOptions(rotated).free).toEqual([]);
+  });
+
+  test("direct Chat picker exposes only the backend OpenRouter catalog", () => {
+    expect(selectableModelsForEngine("chat")).toEqual(CHAT_MODELS);
+    expect(CHAT_MODELS.map((model) => model.value)).toEqual([
+      "anthropic/claude-sonnet-5",
+      "anthropic/claude-opus-4.8",
+      "anthropic/claude-haiku-4.5",
+      "z-ai/glm-5.2",
+    ]);
+    expect(supportsPreSessionModelSelection("chat")).toBe(true);
+  });
+
+  test("Claude uses its backend-policy model ids while generic ACP stays fixed", () => {
+    expect(selectableModelsForEngine("claude").map((model) => model.value)).toEqual([
+      "claude-opus-5",
+      "claude-sonnet-5",
+      "claude-fable-5",
+      "claude-haiku-4-5",
+    ]);
+    expect(selectableModelsForEngine("acp")).toEqual([]);
+  });
+
+  test("keeps model selection available while supported sessions are booting", () => {
+    expect(supportsPreSessionModelSelection("codex")).toBe(true);
+    expect(supportsPreSessionModelSelection("opencode")).toBe(true);
+    expect(supportsPreSessionModelSelection("claude")).toBe(true);
+  });
+
+  test("labels resolve against the engine-specific catalog", () => {
+    expect(modelLabel("gpt-5.6-terra", "codex")).toBe("GPT-5.6 Terra");
+    expect(modelLabel("openai/gpt-5.6-terra", "opencode")).toBe("GPT-5.6 Terra");
+    expect(modelLabel("gpt-5.6-terra", "opencode")).toBe("gpt-5.6-terra");
+  });
+
+  test("backend-configured catalogs filter and preserve exact submitted ids", () => {
+    expect(modelOptionsForEngine("codex", ["gpt-5.6-luna", "gpt-5.4"])).toEqual([
+      { value: "gpt-5.6-luna", label: "GPT-5.6 Luna · Fast" },
+      { value: "gpt-5.4", label: "gpt-5.4" },
+    ]);
+    expect(modelOptionsForEngine("opencode", ["openai/gpt-5.6-sol"])[0]?.value).toBe(
+      "openai/gpt-5.6-sol",
+    );
+    expect(modelOptionsForEngine("claude", ["claude-opus-5"])).toEqual([
+      { value: "claude-opus-5", label: "Opus 5" },
+    ]);
+    expect(modelOptionsForEngine("codex", ["gpt-future"], [
+      { id: "gpt-future", displayName: "Future Model" },
+    ])).toEqual([
+      { value: "gpt-future", label: "Future Model" },
+    ]);
+  });
+
+  test("uses capability endpoint dispatchability as model membership truth", () => {
+    const catalog = {
+      version: 1,
+      scope: "pre_run",
+      engines: [
+        {
+          id: "opencode",
+          configured: true,
+          ready: true,
+          defaultModel: "new/dynamic:free",
+          models: [
+            { id: "openai/gpt-5.6-sol", default: false, dispatchable: false, policyAllowed: true },
+            { id: "openai/gpt-5.6-luna", default: false, dispatchable: true, policyAllowed: true },
+            { id: "new/dynamic:free", default: true, dispatchable: true, policyAllowed: true },
+          ],
+          runtime: { kind: "t3", label: "T3 orchestration · cloud" },
+        },
+      ],
+      tools: { gatewayConfigured: false, declared: [] },
+      nativeSlashCommands: { catalog: "session_runtime", currentRun: null },
+    } satisfies CapabilityCatalog;
+
+    const config = engineConfigFromCapabilityCatalog(catalog);
+    expect(config.engines).toEqual(["opencode"]);
+    expect(config.models.opencode).toEqual(["new/dynamic:free", "openai/gpt-5.6-luna"]);
+    expect(config.modelDetails.opencode).toHaveLength(3);
+    expect(unavailableModelOptions("opencode", config.modelDetails.opencode ?? [])).toEqual([
+      {
+        value: "openai/gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        disabled: true,
+        description: "Currently unavailable",
+      },
+    ]);
+    expect(config.readiness.opencode).toEqual({ ready: true, reason: "enabled" });
+    expect(config.runtimes.opencode).toEqual({
+      kind: "t3",
+      label: "T3 orchestration · cloud",
+    });
+    expect(engineRuntimeCaption("opencode", config.runtimes.opencode, config.readiness.opencode)).toBe(
+      "any model · cloud",
+    );
+    expect(
+      engineRuntimeCaption(
+        "claude",
+        { kind: "acp_compat", label: "Claude Code ACP compatibility · cloud" },
+        { ready: false, reason: "not_proven" },
+      ),
+    ).toBe("Anthropic agent · cloud · needs attention");
+  });
+
+  test("primary engine captions never expose transport implementation names", () => {
+    expect(engineRuntimeCaption(
+      "codex",
+      { kind: "acp_compat", label: "Codex ACP compatibility · cloud" },
+      { ready: true, reason: "enabled" },
+    )).toBe("OpenAI agent · cloud");
+    expect(engineRuntimeCaption(
+      "claude",
+      { kind: "t3", label: "T3 orchestration · cloud" },
+      { ready: true, reason: "enabled" },
+    )).toBe("Anthropic agent · cloud");
+  });
+});

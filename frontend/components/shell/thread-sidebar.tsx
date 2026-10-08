@@ -1,0 +1,161 @@
+"use client";
+
+import {
+  RiAddLine,
+  RiBook3Line,
+  RiBookShelfLine,
+  RiBroadcastLine,
+  RiChat3Line,
+  RiDashboardLine,
+  RiDatabase2Line,
+  RiKey2Line,
+  RiListCheck2,
+  RiRobot2Line,
+} from "@remixicon/react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { chatTitle } from "@/components/shell/chat-title";
+import { useRailFolded } from "@/components/shell/rail-folded";
+import { SidebarBookmarks } from "@/components/shell/sidebar-bookmarks";
+import {
+  SidebarGroup,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+} from "@/components/sidebar-kit/sidebar";
+import { useCapabilityCatalog } from "@/hooks/use-capability-catalog";
+import { AppSidebarFrame, NavRoutes, type Route } from "./app-sidebar-frame";
+import { SidebarProjects } from "./sidebar-projects";
+import { useSidebarThreads } from "./sidebar-threads-provider";
+import { WorkingProjectStatus } from "./working-project-status";
+
+export type ThreadSidebarActive = "new" | "dashboard" | "bots" | "library" | "settings";
+
+/** Icon-rail stand-in for the thread tree: the six most recent threads with tooltips. */
+function CollapsedThreads() {
+  const pathname = usePathname();
+  const runs = useSidebarThreads();
+  return (
+    <SidebarGroup className="items-center p-0 pt-2">
+      <SidebarMenu className="items-center gap-1">
+        {runs.slice(0, 6).map((run) => {
+          const href = `/session/${run.id}`;
+          return (
+            <SidebarMenuItem key={run.id} className="w-8">
+              <SidebarMenuButton
+                className="justify-center rounded-2lg text-text-secondary hover:bg-background-secondary-hover hover:text-text-primary"
+                isActive={pathname === href}
+                render={
+                  <Link
+                    aria-current={pathname === href ? "page" : undefined}
+                    aria-label={chatTitle(run.prompt)}
+                    href={href}
+                  />
+                }
+                tooltip={chatTitle(run.prompt)}
+              >
+                <RiChat3Line className="size-4" aria-hidden />
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          );
+        })}
+      </SidebarMenu>
+    </SidebarGroup>
+  );
+}
+
+/**
+ * The thread rail: the app sidebar frame around the product's own nav rows and
+ * project thread tree. The tree keeps everything the previous rail had -
+ * folders, nested delegated children, status dots, per-project actions and the
+ * "Show N more" disclosures - because it is the same component.
+ */
+/** The rail item a pathname belongs to; undefined for pages without one (threads, lab). */
+export function threadSidebarActiveFor(pathname: string | null): ThreadSidebarActive | undefined {
+  if (!pathname) return undefined;
+  if (pathname === "/agent/new") return "new";
+  if (pathname === "/dashboard") return "dashboard";
+  if (pathname === "/bots" || pathname.startsWith("/bots/")) return "bots";
+  if (pathname === "/settings") return "settings";
+  return undefined;
+}
+
+export function ThreadSidebar({ active }: { active?: ThreadSidebarActive }) {
+  const { catalog } = useCapabilityCatalog();
+  const isCollapsed = useRailFolded();
+  const pathname = usePathname();
+  const current = active ?? threadSidebarActiveFor(pathname);
+
+  const routes: Route[] = [
+    {
+      id: "new",
+      title: "New thread",
+      icon: RiAddLine,
+      tone: "primary",
+      href: "/agent/new",
+      active: current === "new",
+    },
+    {
+      id: "dashboard",
+      title: "Dashboard",
+      icon: RiDashboardLine,
+      tone: "purple",
+      href: "/dashboard",
+      active: current === "dashboard",
+      trailing: <WorkingProjectStatus />,
+    },
+    ...(catalog?.bots
+      ? [
+          {
+            id: "bots",
+            title: "Bots",
+            icon: RiRobot2Line,
+            tone: "blue" as const,
+            href: "/bots",
+            prefetch: false,
+            active: current === "bots",
+          },
+        ]
+      : []),
+    {
+      id: "customize",
+      title: "Customize",
+      icon: RiBookShelfLine,
+      tone: "green",
+      href: "/skills",
+      active: current === "library",
+    },
+    {
+      id: "library",
+      title: "Library",
+      icon: RiBook3Line,
+      tone: "orange",
+      href: "/artifacts",
+      subs: [
+        {
+          title: "Artifacts",
+          href: "/artifacts",
+          icon: RiBroadcastLine,
+          active: pathname === "/artifacts",
+        },
+        { title: "Tasks", href: "/tasks", icon: RiListCheck2, active: pathname === "/tasks" },
+        { title: "Memory", href: "/memory", icon: RiDatabase2Line, active: pathname === "/memory" },
+        { title: "Secrets", href: "/secrets", icon: RiKey2Line, active: pathname === "/secrets" },
+      ],
+    },
+  ];
+
+  return (
+    <AppSidebarFrame>
+      <NavRoutes routes={routes} />
+      {isCollapsed ? (
+        <CollapsedThreads />
+      ) : (
+        <>
+          <SidebarBookmarks />
+          <SidebarProjects />
+        </>
+      )}
+    </AppSidebarFrame>
+  );
+}

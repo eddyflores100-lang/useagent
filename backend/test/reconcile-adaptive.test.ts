@@ -1,0 +1,833 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { and, eq, sql } from "drizzle-orm";
+import { db } from "../src/db/client";
+import { providerEvents, reconcileQueue } from "../src/db/schema";
+import type { EngineId } from "../src/db/schema";
+import type { HarnessInterimEvent } from "../src/engines/types";
+import type { PermissionMode } from "@useagent/agent-client/wire";
+import { approvalEventId, type RuntimeApprovalReplyDependencies } from "../src/engines/runtime-approval";
+import type { SandboxHandle } from "../src/sandboxes/provider";
+import { acceptRunCommand } from "../src/commands";
+import { acceptRunCancel, CANCEL_SUMMARY } from "../src/commands/cancel";
+import {
+  createTickGuard,
+  ingestReconciliationEvents,
+  recoverStaleRuns,
+  runDueReconciles,
+  RUN_RECONCILING,
+  type ReconcileProbe,
+} from "../src/runs/recovery";
+import { bumpReconcile, claimDueReconciles, enqueueReconcile, getReconcile, reconcileClaimHeldForUpdate } from "../src/runs/reconcile-queue";
+import { finalizeRun } from "../src/runs/finalize";
+import { CaptureFenceError, recordProviderEvent } from "../src/runs/provider-events";
+import { getRun, getStepsApi, insertStep, setRunProviderSession, setRunSandbox, setRunStatus, STALE_SUMMARY } from "../src/runs/repo";
+import { uid } from "./helpers";
+import { providerSessionBinding } from "@useagent/agent-harness/canonical";
+import { providerProtocolIdentity } from "@useagent/agent-harness/control";
+import { t3ProviderDrivers } from "../src/engines/t3-provider-driver";
+
+// The ADAPTIVE reconciler (#63): boot PARKS a transient run instead of honest-
+// failing it, and a background loop re-probes within a budget. Covers park-on-
+// boot (+ marker + thread stays reserved), reconcile-after-delay, fail-after-
+// budget, no-double-adopt, and survives-own-restart.
+
+const ORG = "org-skynet-dev";
+const transientProbe: ReconcileProbe = async () => ({ status: "unreachable" });
+const completedProbe: ReconcileProbe = async () => ({ status: "completed", summary: "adopted answer" });
+
+/** Seed a running opencode run with a dispatched command + a step watermark. */
+async function seedRunning(
+  engine: EngineId = "opencode",
+  permissionMode?: PermissionMode,
+): Promise<{ runId: string; threadId: string }> {
+  const id = uid("run");
+  await acceptRunCommand({
+    idempotencyKey: null,
+    orgId: ORG,
+    actorId: null,
+    run: {
+      id,
+      prompt: "x",
+      model: engine === "codex" ? "gpt-5.6-luna" : "claude-opus-5",
+      engine,
+      parentRunId: null,
+      threadId: id,
+      ...(permissionMode ? { permissionMode } : {}),
+    },
+  });
+  await setRunStatus(id, "running");
+  await setRunSandbox(id, "sb_x");
+  const driver = engine === "opencode"
+    ? t3ProviderDrivers.opencode
+    : t3ProviderDrivers[engine as "codex" | "claude"];
+  await setRunProviderSession(id, providerSessionBinding({
+    provider: engine === "daytona" ? "opencode" : engine,
+    nativeSessionId: "ses_x",
+    protocolVersion: providerProtocolIdentity(driver.descriptor.protocol),
+    runtime: { kind: "sandbox", id: "sb_x" },
+    capabilities: {} as never,
+    generation: driver.descriptor.sessionGeneration as number,
+  }));
+  await db.execute(sql`update commands set state='dispatched' where run_id=${id} and kind='run.create'`);
+  await insertStep({ runId: id, idx: 0, kind: "task", label: "Thinking…", chip: "opencode", code: null });
+  return { runId: id, threadId: id };
+}
+
+async function park(runId: string, threadId: string, over: Partial<{ nextAttemptAt: Date; deadline: Date }> = {}) {
+  await enqueueReconcile({
+    runId,
+    threadId,
+    sandboxId: "sb_x",
+    sessionId: "ses_x",
+    sinceAt: new Date(0),
+    nextAttemptAt: over.nextAttemptAt ?? new Date(Date.now() - 1_000),
+    deadline: over.deadline ?? new Date(Date.now() + 300_000),
+  });
+}
+
+async function reconcilingMarkers(runId: string) {
+  for (let i = 0; i < 40; i++) {
+    const rows = await db
+      .select()
+      .from(providerEvents)
+      .where(and(eq(providerEvents.runId, runId), eq(providerEvents.eventType, RUN_RECONCILING)));
+    if (rows.length > 0) return rows;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return [];
+}
+
+beforeEach(async () => {
+  await db.execute(sql`delete from reconcile_queue`);
+});
+afterEach(async () => {
+  await db.execute(sql`delete from reconcile_queue`);
+});
+
+describe("boot PARK instead of honest-fail (#63)", () => {
+  test("a transient running opencode run is PARKED (still running), marked, thread reserved", async () => {
+    const { runId } = await seedRunning();
+    const res = await recoverStaleRuns(transientProbe);
+    expect(res.parked).toBeGreaterThanOrEqual(1);
+    expect((await getRun(runId))?.status).toBe("running"); // NOT failed
+    expect(await getReconcile(runId)).not.toBeNull(); // parked durably
+    expect((await reconcilingMarkers(runId)).length).toBe(1); // reconciling marker emitted
+    // The command stays dispatched (thread reserved) so no reply dispatches over it.
+    const [cmd] = (await db.execute(
+      sql`select state from commands where run_id=${runId} and kind='run.create'`,
+    )) as unknown as [{ state: string }];
+    expect(cmd.state).toBe("dispatched");
+  });
+});
+
+describe("background re-probe loop", () => {
+  test("re-probes with the parked run's actual provider", async () => {
+    const { runId, threadId } = await seedRunning("codex");
+    await park(runId, threadId);
+    const providers: string[] = [];
+
+    await runDueReconciles(async (handle) => {
+      providers.push(handle.provider);
+      return { status: "unreachable" };
+    });
+
+    expect(providers).toEqual(["codex"]);
+  });
+
+  test("a parked reconcile loser accounts from the durable first writer", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    let releaseProbe!: () => void;
+    let reportProbe!: () => void;
+    const release = new Promise<void>((resolve) => { releaseProbe = resolve; });
+    const probing = new Promise<void>((resolve) => { reportProbe = resolve; });
+    const reconciliation = runDueReconciles(async () => {
+      reportProbe();
+      await release;
+      return { status: "completed", summary: "late completion" };
+    });
+    await probing;
+    await finalizeRun(runId, "failed", "first writer failed", 1);
+    releaseProbe();
+    const result = await reconciliation;
+    expect((await getRun(runId))?.status).toBe("failed");
+    expect(result.failed).toBe(1);
+    expect(result.adopted).toBe(0);
+  });
+
+  test("a durable cancel settles a parked run without another provider probe", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    await acceptRunCancel({ orgId: ORG, actorId: null, runId });
+    let probed = false;
+
+    const out = await runDueReconciles(async () => {
+      probed = true;
+      return { status: "completed", summary: "must not win" };
+    });
+
+    expect(probed).toBe(false);
+    expect(out.failed).toBe(1);
+    expect((await getRun(runId))?.summary).toBe(CANCEL_SUMMARY);
+    expect(await getReconcile(runId)).toBeNull();
+  });
+
+  test("reconcile-after-delay: a finished session is ADOPTED", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    const out = await runDueReconciles(completedProbe);
+    expect(out.adopted).toBe(1);
+    const run = await getRun(runId);
+    expect(run?.status).toBe("completed");
+    expect(run?.summary).toBe("adopted answer");
+    expect(await getReconcile(runId)).toBeNull(); // dequeued
+  });
+
+  test("fail-after-budget: past the deadline, honest-fail with the resumable summary", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId, { deadline: new Date(Date.now() - 1) }); // budget already spent
+    const out = await runDueReconciles(transientProbe);
+    expect(out.failed).toBe(1);
+    const run = await getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.summary).toBe(STALE_SUMMARY);
+    expect(await getReconcile(runId)).toBeNull();
+  });
+
+  test("retry before the deadline: reschedules, keeps the run running + parked", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId, { deadline: new Date(Date.now() + 300_000) });
+    const out = await runDueReconciles(transientProbe);
+    expect(out.retried).toBe(1);
+    expect((await getRun(runId))?.status).toBe("running");
+    const row = await getReconcile(runId);
+    expect(row?.attempts).toBe(1);
+    expect(row!.nextAttemptAt.getTime()).toBeGreaterThan(Date.now()); // rescheduled forward
+  });
+
+  test("no-double-adopt: a run already settled by another lane is dropped, not re-finalized", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    // Another lane settled it (e.g. a reply's worker / cancel) → completed with ITS summary.
+    await setRunStatus(runId, "completed");
+    const out = await runDueReconciles(completedProbe);
+    expect(out.dropped).toBe(1);
+    expect(out.adopted).toBe(0);
+    expect(await getReconcile(runId)).toBeNull(); // parked row cleared
+    expect((await getRun(runId))?.status).toBe("completed");
+  });
+});
+
+describe("continuity during re-probe (interim events + heartbeat)", () => {
+  test("a reachable probe cannot heartbeat after a concurrent settlement", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    await runDueReconciles(async () => {
+      await setRunStatus(runId, "completed");
+      return { status: "in_progress" };
+    });
+    expect((await getRun(runId))?.status).toBe("completed");
+    expect(await db.select().from(providerEvents).where(and(
+      eq(providerEvents.runId, runId), eq(providerEvents.eventType, RUN_RECONCILING),
+    ))).toHaveLength(0);
+  });
+  const interimEvents: HarnessInterimEvent[] = [
+    {
+      id: "pe_part1",
+      provider: "opencode",
+      eventType: "part.tool.completed",
+      sessionId: "ses_x",
+      messageId: "msg_1",
+      partId: "part1",
+      callId: "call_1",
+      payload: { type: "tool", state: { status: "completed" } },
+    },
+    {
+      id: "pe_part2",
+      provider: "opencode",
+      eventType: "part.text",
+      sessionId: "ses_x",
+      messageId: "msg_1",
+      partId: "part2",
+      payload: { type: "text", text: "still working" },
+    },
+  ];
+  const inProgressProbe: ReconcileProbe = async () => ({ status: "in_progress", events: interimEvents });
+
+  async function interimRows(runId: string) {
+    return db
+      .select()
+      .from(providerEvents)
+      .where(and(eq(providerEvents.runId, runId), sql`${providerEvents.eventType} like 'part.%'`));
+  }
+
+  test("interim in_progress events are ingested once and stay deduped across probes", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+
+    const first = await runDueReconciles(inProgressProbe);
+    expect(first.retried).toBe(1); // still running, rescheduled
+    expect(first.eventsRecovered).toBe(2);
+    const firstRows = await interimRows(runId);
+    expect(firstRows).toHaveLength(2);
+    expect(firstRows.every((row) => row.id.startsWith(`${runId}:`))).toBe(true);
+    expect((await getRun(runId))?.status).toBe("running"); // finalize untouched
+
+    // Make the parked row due again and re-probe with the SAME events.
+    await db
+      .update(reconcileQueue)
+      .set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+      .where(eq(reconcileQueue.runId, runId));
+    const second = await runDueReconciles(inProgressProbe);
+    expect(second.eventsRecovered).toBe(2);
+    // Upsert on the live-lane part id → still exactly two rows, no duplicates.
+    expect((await interimRows(runId)).length).toBe(2);
+  });
+
+  test("a reachable re-probe heartbeats the reconciling marker with lastProbeAt + eventsRecovered", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+
+    const before = Date.now();
+    await runDueReconciles(inProgressProbe);
+
+    const markers = await reconcilingMarkers(runId);
+    expect(markers.length).toBe(1); // stable id → one marker, advanced in place
+    const payload = JSON.parse(markers[0]!.payload as string) as {
+      reason: string;
+      eventsRecovered: number;
+      lastProbeAt: number;
+      deadlineMs: number;
+    };
+    expect(payload.reason).toBe("reprobe");
+    expect(payload.eventsRecovered).toBe(2);
+    expect(payload.lastProbeAt).toBeGreaterThanOrEqual(before);
+  });
+
+  test("an unreachable re-probe fakes no progress: no heartbeat, no interim rows", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+
+    const out = await runDueReconciles(transientProbe); // unreachable
+    expect(out.retried).toBe(1);
+    expect(out.eventsRecovered).toBe(0);
+    expect((await interimRows(runId)).length).toBe(0);
+    const markers = await db
+      .select()
+      .from(providerEvents)
+      .where(and(eq(providerEvents.runId, runId), eq(providerEvents.eventType, RUN_RECONCILING)));
+    expect(markers.length).toBe(0);
+  });
+
+  test("adoption is unchanged: a completed probe adopts with no interim ingest or heartbeat", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+
+    const out = await runDueReconciles(completedProbe);
+    expect(out.adopted).toBe(1);
+    expect(out.eventsRecovered).toBe(0);
+    const run = await getRun(runId);
+    expect(run?.status).toBe("completed");
+    expect(run?.summary).toBe("adopted answer");
+    expect(await getReconcile(runId)).toBeNull();
+    expect((await interimRows(runId)).length).toBe(0);
+    const markers = await db
+      .select()
+      .from(providerEvents)
+      .where(and(eq(providerEvents.runId, runId), eq(providerEvents.eventType, RUN_RECONCILING)));
+    expect(markers.length).toBe(0);
+  });
+
+  test("a completed re-probe persists its tail before adoption and reuses exact stable ids", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    const eventId = `pe_${runId}_t3_tail`;
+    const out = await runDueReconciles(async () => ({
+      status: "completed",
+      summary: "adopted with tail",
+      events: [{
+        id: eventId,
+        runScopedId: true,
+        provider: "t3",
+        eventType: "t3.activity.tool.completed",
+        sessionId: "ses_x",
+        partId: "tail",
+        callId: "call-tail",
+      }],
+    }));
+
+    expect(out.adopted).toBe(1);
+    const [event] = await db.select().from(providerEvents).where(eq(providerEvents.id, eventId));
+    const run = await getRun(runId);
+    expect(event?.runId).toBe(runId);
+    expect(event?.createdAt.getTime()).toBeLessThanOrEqual(run!.settledAt!.getTime());
+    expect((await db.select().from(providerEvents).where(eq(providerEvents.id, eventId)))).toHaveLength(1);
+  });
+
+  test("a failed re-probe persists its tail before finalizing with the provider reason", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    const eventId = `pe_${runId}_t3_failed-tail`;
+    const out = await runDueReconciles(async () => ({
+      status: "failed",
+      summary: "Provider runtime turn failed",
+      events: [{
+        id: eventId,
+        runScopedId: true,
+        provider: "t3",
+        eventType: "t3.activity.runtime.warning",
+        partId: "failed-tail",
+      }],
+    }));
+
+    expect(out.failed).toBe(1);
+    const run = await getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.summary).toBe("Provider runtime turn failed");
+    const [event] = await db.select().from(providerEvents).where(eq(providerEvents.id, eventId));
+    expect(event?.createdAt.getTime()).toBeLessThanOrEqual(run!.settledAt!.getTime());
+    expect(await getReconcile(runId)).toBeNull();
+  });
+
+  test("a failed update of an existing terminal event stays parked for retry", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    const eventId = `pe_${runId}_t3_stable-tail`;
+    await recordProviderEvent({
+      id: eventId,
+      runId,
+      threadId,
+      provider: "t3",
+      eventType: "t3.activity.tool.started",
+      nativePartId: "stable-tail",
+    }, { required: true });
+    const out = await runDueReconciles(async () => ({
+      status: "completed",
+      summary: "must not seal",
+      events: [{
+        id: eventId,
+        runScopedId: true,
+        provider: "t3",
+        eventType: null as never,
+        partId: "stable-tail",
+      }],
+    }));
+
+    expect(out.adopted).toBe(0);
+    expect(out.retried).toBe(1);
+    expect((await getRun(runId))?.status).toBe("running");
+    expect((await getReconcile(runId))?.attempts).toBe(1);
+    const [event] = await db.select().from(providerEvents).where(eq(providerEvents.id, eventId));
+    expect(event?.eventType).toBe("t3.activity.tool.started");
+  });
+
+  test("an expired terminal backfill failure releases the run instead of retrying forever", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId, { deadline: new Date(Date.now() - 1) });
+    const eventId = `pe_${runId}_t3_expired-tail`;
+    await recordProviderEvent({
+      id: eventId,
+      runId,
+      threadId,
+      provider: "t3",
+      eventType: "t3.activity.tool.started",
+    }, { required: true });
+    const out = await runDueReconciles(async () => ({
+      status: "completed",
+      summary: "must not seal complete",
+      events: [{
+        id: eventId,
+        runScopedId: true,
+        provider: "t3",
+        eventType: null as never,
+      }],
+    }));
+
+    expect(out.retried).toBe(0);
+    expect(out.failed).toBe(1);
+    expect((await getRun(runId))?.status).toBe("failed");
+    expect((await getRun(runId))?.summary).toBe(STALE_SUMMARY);
+    expect(await getReconcile(runId)).toBeNull();
+  });
+});
+
+describe("survives the reconciler's own restart", () => {
+  test("re-running boot recovery re-parks idempotently, preserving the original deadline", async () => {
+    const { runId } = await seedRunning();
+    await recoverStaleRuns(transientProbe); // first boot → park
+    const first = await getReconcile(runId);
+    expect(first).not.toBeNull();
+    const originalDeadline = first!.deadline.getTime();
+
+    // Simulate a restart mid-window: boot recovery runs again over the same run.
+    const res2 = await recoverStaleRuns(transientProbe);
+    expect(res2.parked).toBeGreaterThanOrEqual(1);
+    const second = await getReconcile(runId);
+    expect(second!.deadline.getTime()).toBe(originalDeadline); // budget NOT extended
+    expect((await getRun(runId))?.status).toBe("running"); // still parked, not failed
+  });
+});
+
+describe("overlapping ticks", () => {
+  test("two ticks in flight at once probe each parked run once and do not inflate attempts", async () => {
+    const runs = [await seedRunning(), await seedRunning(), await seedRunning()];
+    for (const r of runs) await park(r.runId, r.threadId);
+    const probed: string[] = [];
+    const slowProbe: ReconcileProbe = async (_handle, opts) => {
+      probed.push(opts.eventContext.runId);
+      await new Promise((r) => setTimeout(r, 40));
+      return { status: "unreachable" };
+    };
+
+    const [a, b] = await Promise.all([runDueReconciles(slowProbe), runDueReconciles(slowProbe)]);
+
+    expect(probed.toSorted()).toEqual(runs.map((r) => r.runId).toSorted());
+    expect(a.retried + b.retried).toBe(3);
+    for (const r of runs) expect((await getReconcile(r.runId))?.attempts).toBe(1);
+    // Settle the parked runs so a later file's boot recovery does not find them dispatched.
+    for (const r of runs) await finalizeRun(r.runId, "failed", "test teardown", 0);
+  });
+
+  test("a tick that stalls past its lease is replaced; when it resumes it cannot inflate attempts or overwrite the replacement's schedule", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    let releaseA!: () => void;
+    let aProbing!: () => void;
+    const aReleased = new Promise<void>((r) => { releaseA = r; });
+    const aStarted = new Promise<void>((r) => { aProbing = r; });
+    const tickA = runDueReconciles(async () => {
+      aProbing();
+      await aReleased;
+      return { status: "unreachable" };
+    });
+    await aStarted;
+    // A's lease expires while it is stalled: the row is due again, and a resurrected tick B
+    // claims it and finishes its own probe.
+    await db.update(reconcileQueue).set({ nextAttemptAt: new Date(Date.now() - 1_000) }).where(eq(reconcileQueue.runId, runId));
+    const b = await runDueReconciles(transientProbe);
+    expect(b.retried).toBe(1);
+    const afterB = await getReconcile(runId);
+    expect(afterB?.attempts).toBe(1);
+
+    releaseA();
+    const a = await tickA;
+    expect(a.retried).toBe(0);
+    expect(a.lost).toBe(1); // A's reschedule was fenced and it says so
+    const afterA = await getReconcile(runId);
+    expect(afterA?.attempts).toBe(1); // no second attempt
+    expect(afterA!.nextAttemptAt.getTime()).toBe(afterB!.nextAttemptAt.getTime()); // B's schedule stands
+    await finalizeRun(runId, "failed", "test teardown", 0);
+  });
+
+  test("a stale tick cannot finalize the run its replacement adopted", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId, { deadline: new Date(Date.now() - 1) }); // A would honest-fail it
+    let releaseA!: () => void;
+    let aProbing!: () => void;
+    const aReleased = new Promise<void>((r) => { releaseA = r; });
+    const aStarted = new Promise<void>((r) => { aProbing = r; });
+    const tickA = runDueReconciles(async () => {
+      aProbing();
+      await aReleased;
+      return { status: "unreachable" };
+    });
+    await aStarted;
+    // A's lease expires while it is stalled; B re-claims and adopts the finished session.
+    await db.update(reconcileQueue).set({ nextAttemptAt: new Date(Date.now() - 1_000) }).where(eq(reconcileQueue.runId, runId));
+    const b = await runDueReconciles(completedProbe);
+    expect(b.adopted).toBe(1);
+    expect((await getRun(runId))?.summary).toBe("adopted answer");
+
+    releaseA();
+    const a = await tickA;
+    expect(a.lost).toBe(1);
+    expect(a.failed).toBe(0);
+    const run = await getRun(runId);
+    expect(run?.status).toBe("completed"); // B's adoption stands; A's stale failure never committed
+    expect(run?.summary).toBe("adopted answer");
+  });
+
+  test("a stale tick cannot write recovered events over its replacement's newer payloads", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    const eventId = `pe_${runId}_t3_shared`;
+    const event = (text: string): HarnessInterimEvent => ({
+      id: eventId, runScopedId: true, provider: "t3", eventType: "t3.activity.message.delta",
+      sessionId: "ses_x", partId: "shared", payload: { text },
+    });
+    let releaseA!: () => void;
+    let aProbing!: () => void;
+    const aReleased = new Promise<void>((r) => { releaseA = r; });
+    const aStarted = new Promise<void>((r) => { aProbing = r; });
+    const tickA = runDueReconciles(async () => {
+      aProbing();
+      await aReleased;
+      return { status: "in_progress", events: [event("older")] };
+    });
+    await aStarted;
+    await db.update(reconcileQueue).set({ nextAttemptAt: new Date(Date.now() - 1_000) }).where(eq(reconcileQueue.runId, runId));
+    const b = await runDueReconciles(async () => ({ status: "in_progress", events: [event("newer")] }));
+    expect(b.eventsRecovered).toBe(1);
+
+    releaseA();
+    const a = await tickA;
+    expect(a.lost).toBe(1);
+    expect(a.eventsRecovered).toBe(0);
+    const [row] = await db.select().from(providerEvents).where(eq(providerEvents.id, eventId));
+    expect(JSON.parse(row!.payload as string)).toEqual({ text: "newer" });
+    expect((await getReconcile(runId))?.attempts).toBe(1);
+    await finalizeRun(runId, "failed", "test teardown", 0);
+  });
+
+  test("a stale tick that resumes while its replacement is still running cannot finalize; the replacement then adopts", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId, { deadline: new Date(Date.now() - 1) });
+    const gate = () => { let open!: () => void; const p = new Promise<void>((r) => { open = r; }); return { p, open }; };
+    const aStarted = gate(); const aReleased = gate();
+    const bStarted = gate(); const bReleased = gate();
+    const tickA = runDueReconciles(async () => { aStarted.open(); await aReleased.p; return { status: "unreachable" }; });
+    await aStarted.p;
+    await db.update(reconcileQueue).set({ nextAttemptAt: new Date(Date.now() - 1_000) }).where(eq(reconcileQueue.runId, runId));
+    const tickB = runDueReconciles(async () => { bStarted.open(); await bReleased.p; return { status: "completed", summary: "B adopted" }; });
+    await bStarted.p; // B holds the claim and is mid-probe
+    aReleased.open();
+    const a = await tickA; // A resumes first: its stale honest-fail is fenced by B's lease
+    expect(a.lost).toBe(1);
+    expect((await getRun(runId))?.status).toBe("running");
+    bReleased.open();
+    const b = await tickB;
+    expect(b.adopted).toBe(1);
+    expect((await getRun(runId))?.summary).toBe("B adopted");
+  });
+
+  test("a stale heartbeat is fenced and the stale tick counts the entry as lost, not retried", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    let releaseA!: () => void;
+    let aProbing!: () => void;
+    const aReleased = new Promise<void>((r) => { releaseA = r; });
+    const aStarted = new Promise<void>((r) => { aProbing = r; });
+    const tickA = runDueReconciles(async () => { aProbing(); await aReleased; return { status: "in_progress", events: [] }; });
+    await aStarted;
+    await db.update(reconcileQueue).set({ nextAttemptAt: new Date(Date.now() - 1_000) }).where(eq(reconcileQueue.runId, runId));
+    const b = await runDueReconciles(transientProbe); // unreachable: no heartbeat, rescheduled
+    expect(b.retried).toBe(1);
+    releaseA();
+    const a = await tickA;
+    expect(a.lost).toBe(1);
+    expect(a.retried).toBe(0);
+    await new Promise((r) => setTimeout(r, 100));
+    expect((await reconcilingMarkers(runId)).length).toBe(0); // A's heartbeat never landed
+    expect((await getReconcile(runId))?.attempts).toBe(1);
+    await finalizeRun(runId, "failed", "test teardown", 0);
+  });
+
+  test("a fenced write is atomic with its ownership check: a stale lease writes nothing, the live lease writes", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    const [claim] = await claimDueReconciles(1);
+    const stale = new Date(claim!.leaseUntil.getTime() - 1);
+    const write = (lease: Date, text: string) => recordProviderEvent({
+      id: `pe_${runId}_t3_fenced`, runId, threadId, provider: "t3", eventType: "t3.activity.message.delta",
+      nativePartId: "fenced", payload: { text },
+    }, { required: true, fence: (tx) => reconcileClaimHeldForUpdate(runId, lease, tx) });
+    await expect(write(stale, "stale")).rejects.toBeInstanceOf(CaptureFenceError);
+    expect(await db.select().from(providerEvents).where(eq(providerEvents.id, `pe_${runId}_t3_fenced`))).toHaveLength(0);
+    await write(claim!.leaseUntil, "live");
+    const [row] = await db.select().from(providerEvents).where(eq(providerEvents.id, `pe_${runId}_t3_fenced`));
+    expect(JSON.parse(row!.payload as string)).toEqual({ text: "live" });
+    await finalizeRun(runId, "failed", "test teardown", 0);
+  });
+
+  test("the fence holds the claim row locked across the write: a competing transition waits until the write commits", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    const [claim] = await claimDueReconciles(1);
+    let releaseWrite!: () => void;
+    let fenceChecked!: () => void;
+    const writeReleased = new Promise<void>((r) => { releaseWrite = r; });
+    const checked = new Promise<void>((r) => { fenceChecked = r; });
+    const write = recordProviderEvent({
+      id: `pe_${runId}_t3_locked`, runId, threadId, provider: "t3", eventType: "t3.activity.message.delta",
+      nativePartId: "locked", payload: { text: "held" },
+    }, {
+      required: true,
+      fence: async (tx) => {
+        const held = await reconcileClaimHeldForUpdate(runId, claim!.leaseUntil, tx);
+        fenceChecked();
+        await writeReleased; // the ownership check passed; the row stays locked until the write commits
+        return held;
+      },
+    });
+    await checked;
+    // A competing ownership transition on the same row cannot get past the lock.
+    let bumped: boolean | null = null;
+    const competing = bumpReconcile(runId, new Date(Date.now() + 15_000), claim!.leaseUntil).then((ok) => { bumped = ok; return ok; });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(bumped).toBeNull(); // still waiting behind the fenced write
+    releaseWrite();
+    await write;
+    expect(await competing).toBe(true); // it ran only after the write committed
+    const [row] = await db.select().from(providerEvents).where(eq(providerEvents.id, `pe_${runId}_t3_locked`));
+    expect(JSON.parse(row!.payload as string)).toEqual({ text: "held" });
+    // And with the lease now moved on, the same fence lets nothing through.
+    await expect(recordProviderEvent({
+      id: `pe_${runId}_t3_locked`, runId, threadId, provider: "t3", eventType: "t3.activity.message.delta",
+      nativePartId: "locked", payload: { text: "stale" },
+    }, { required: true, fence: (tx) => reconcileClaimHeldForUpdate(runId, claim!.leaseUntil, tx) })).rejects.toBeInstanceOf(CaptureFenceError);
+    await finalizeRun(runId, "failed", "test teardown", 0);
+  });
+
+  test("a claim lost between two recovered events keeps the first event and its count", async () => {
+    const { runId, threadId } = await seedRunning();
+    await park(runId, threadId);
+    const [claim] = await claimDueReconciles(1);
+    const events: HarnessInterimEvent[] = ["first", "second"].map((part) => ({
+      id: `pe_${runId}_t3_${part}`, runScopedId: true, provider: "t3", eventType: "t3.activity.message.delta",
+      sessionId: "ses_x", partId: part, payload: { text: part },
+    }));
+    let writes = 0;
+    // The claim moves on between the two writes (as a replacement's claim would).
+    const fence = async (tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => {
+      if (writes++ === 1) {
+        await db.update(reconcileQueue).set({ nextAttemptAt: new Date(Date.now() + 90_000) }).where(eq(reconcileQueue.runId, runId));
+      }
+      return reconcileClaimHeldForUpdate(runId, claim!.leaseUntil, tx);
+    };
+    const redact = { text: (v: string) => v, unknown: (v: unknown) => v } as never;
+    const outcome = await ingestReconciliationEvents({ runId, threadId }, redact, events, false, fence).catch((e) => e);
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as { recovered?: number }).recovered).toBe(1); // the first event's count survives the lost claim
+    const rows = await db.select().from(providerEvents).where(and(eq(providerEvents.runId, runId), sql`${providerEvents.id} like ${`pe_${runId}_t3_%`}`));
+    expect(rows.map((r) => r.id)).toEqual([`pe_${runId}_t3_first`]); // and only the first landed
+    await finalizeRun(runId, "failed", "test teardown", 0);
+  });
+
+  test("a fence without required still surfaces the lost claim to the caller", async () => {
+    const { runId, threadId } = await seedRunning();
+    await expect(recordProviderEvent({
+      id: `pe_${runId}_t3_unrequired`, runId, threadId, provider: "t3", eventType: "t3.activity.message.delta",
+    }, { fence: async () => false })).rejects.toBeInstanceOf(CaptureFenceError);
+    await finalizeRun(runId, "failed", "test teardown", 0);
+  });
+
+  test("tick guard: a lost tick that settles late cannot free the guard from under its replacement", () => {
+    const guard = createTickGuard(1_000);
+    const a = guard.start(0);
+    expect(a).toEqual({ generation: 1, resurrected: false });
+    expect(guard.start(500)).toBeNull(); // single-flight inside the watchdog window
+    const b = guard.start(1_000); // A is past the watchdog: treated as lost, B starts
+    expect(b).toEqual({ generation: 2, resurrected: true });
+    guard.settle(a!.generation); // A settles late
+    expect(guard.start(1_100)).toBeNull(); // B still owns the guard: no third tick over it
+    guard.settle(b!.generation);
+    expect(guard.start(1_200)).toEqual({ generation: 3, resurrected: false });
+  });
+});
+
+// A read-only run answers the runtime's own approval requests itself while its
+// worker lives (permission-mode-enforcement.test.ts). Across a restart the
+// parked run's re-probe surfaces the request as a recovered event instead, and
+// the reconcile loop must decline it the same way: through the reply path, once,
+// with the receipt and the refusal step durable, and the turn then goes on.
+describe("read-only refusal across a restart", () => {
+  const requestId = "approval-1";
+  const REFUSAL = "Refused to change files: this run is read-only";
+  const requestedEvent = (runId: string): HarnessInterimEvent => ({
+    id: approvalEventId(runId, requestId, "requested"),
+    runScopedId: true,
+    provider: "t3",
+    eventType: "approval.requested",
+    sessionId: "ses_x",
+    payload: { id: requestId, sessionID: "ses_x", requestKind: "file-change", detail: "write build/out" },
+  });
+  const resolvedEvent = (runId: string): HarnessInterimEvent => ({
+    id: approvalEventId(runId, requestId, "resolved"),
+    runScopedId: true,
+    provider: "t3",
+    eventType: "approval.resolved",
+    sessionId: "ses_x",
+    payload: { requestId, decision: "decline" },
+  });
+  /** The runtime as the reply path sees it: the request pending on the thread, and every dispatch it receives. */
+  function fakeRuntime() {
+    const dispatched: Record<string, unknown>[] = [];
+    const pending = {
+      snapshotSequence: 1,
+      projection: {
+        thread: { id: "ses_x", runtimeMode: "approval-required", activeProviderThreadId: null },
+        runs: [{ id: "turn-1", ordinal: 1, userMessageId: "skynet-message-turn-1", status: "running", providerThreadId: null, requestedAt: "x", startedAt: null, completedAt: null }],
+        messages: [],
+        turnItems: [{ id: "item-1", threadId: "ses_x", runId: "turn-1", type: "approval_request", status: "waiting", title: null, updatedAt: "x", ordinal: 1, requestId, requestKind: "file-change", prompt: "write build/out" }],
+        providerSessions: [],
+        providerThreads: [],
+        runtimeRequests: [{ id: requestId, kind: "file-change", status: "pending" }],
+        subagents: [],
+      },
+    };
+    const approvals: Partial<RuntimeApprovalReplyDependencies> = {
+      resolveSandbox: async () => ({} as SandboxHandle),
+      request: (async () => pending) as unknown as RuntimeApprovalReplyDependencies["request"],
+      dispatch: async (_sandbox, command) => {
+        dispatched.push({ ...command });
+        return { sequence: 2 };
+      },
+    };
+    return { approvals, dispatched };
+  }
+  const makeDue = (runId: string) =>
+    db.update(reconcileQueue).set({ nextAttemptAt: new Date(Date.now() - 1_000) }).where(eq(reconcileQueue.runId, runId));
+  const refusals = async (runId: string) =>
+    (await getStepsApi(runId)).filter((step) => step.label === REFUSAL && step.chip === "read-only");
+
+  test("a pending file change is declined after a restart, never approved, and the turn goes on", async () => {
+    const { runId, threadId } = await seedRunning("opencode", "read-only");
+    await park(runId, threadId);
+    const { approvals, dispatched } = fakeRuntime();
+    let probes = 0;
+    const probe: ReconcileProbe = async () => {
+      probes++;
+      return probes < 3
+        ? { status: "in_progress", events: [requestedEvent(runId)] }
+        : { status: "completed", summary: "Looked around.", events: [requestedEvent(runId), resolvedEvent(runId)] };
+    };
+
+    const first = await runDueReconciles(probe, async () => {}, approvals);
+    expect(first.retried).toBe(1);
+    expect(dispatched).toEqual([
+      expect.objectContaining({ type: "runtime-request.respond", threadId: "ses_x", requestId, decision: "decline" }),
+    ]);
+    const [receipt] = await db
+      .select()
+      .from(providerEvents)
+      .where(eq(providerEvents.id, approvalEventId(runId, requestId, "responded")));
+    expect(JSON.parse(receipt!.payload as string)).toEqual({ requestId, decision: "decline" });
+    expect(await refusals(runId)).toHaveLength(1);
+    expect((await getRun(runId))?.status).toBe("running");
+
+    // The runtime has not recorded the resolution yet, so the same request comes
+    // back; the durable receipt makes the second probe answer nothing again.
+    await makeDue(runId);
+    await runDueReconciles(probe, async () => {}, approvals);
+    expect(dispatched).toHaveLength(1);
+    expect(await refusals(runId)).toHaveLength(1);
+
+    // Declined, the runtime finished the turn: adopted, and nothing was ever approved.
+    await makeDue(runId);
+    const third = await runDueReconciles(probe, async () => {}, approvals);
+    expect(third.adopted).toBe(1);
+    expect((await getRun(runId))?.status).toBe("completed");
+    expect(dispatched.every((command) => command.decision === "decline")).toBe(true);
+  });
+
+  test("a Guard run's pending request is left to a person", async () => {
+    const { runId, threadId } = await seedRunning("opencode", "approval-required");
+    await park(runId, threadId);
+    const { approvals, dispatched } = fakeRuntime();
+    const probe: ReconcileProbe = async () => ({ status: "in_progress", events: [requestedEvent(runId)] });
+    await runDueReconciles(probe, async () => {}, approvals);
+    expect(dispatched).toHaveLength(0);
+    expect(await refusals(runId)).toHaveLength(0);
+    expect(await getReconcile(runId)).not.toBeNull();
+  });
+});

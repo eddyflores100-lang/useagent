@@ -1,0 +1,457 @@
+import { describe, expect, test } from "bun:test";
+import { Hono } from "hono";
+import type { SandboxProvider } from "@useagent/sandbox-contract";
+import type { AppEnv } from "../src/http";
+import { createProviderConnectionsRoutes } from "../src/provider-connections/routes";
+import { clearThreadSandbox, createRun, setRunSandbox } from "../src/runs/repo";
+import { clearMissingRetainedSandboxMappings, listCurrentRetainedSandboxMappings } from "../src/fleet/lease-repo";
+import { db } from "../src/db/client";
+import { runs } from "../src/db/schema";
+import { eq, sql } from "drizzle-orm";
+import {
+  bindingSnapshot,
+  envSandboxBinding,
+  LocalExecutionDisabledError,
+  MachineNotConnectedError,
+  resolveSandboxBindingForRun,
+  resolveSandboxBindingForSandbox,
+  resolveSandboxBindingForThread,
+  userComputersEnabled,
+  type SandboxBinding,
+} from "../src/sandboxes/binding";
+import { createOrgSession, fetchApi, json } from "./helpers";
+
+const fakeProvider = (label: string): SandboxProvider =>
+  ({ label } as unknown as SandboxProvider);
+
+const envBinding: SandboxBinding = { kind: "daytona", provider: fakeProvider("env"), snapshot: null, credential: "env", userId: null, logins: [] };
+
+async function userIdForCookies(cookies: string): Promise<string> {
+  const me = await json<{ user?: { id?: string } }>("/api/auth/get-session", { cookies });
+  const id = me.body.user?.id;
+  if (!id) throw new Error("session has no user");
+  return id;
+}
+
+const runnerStub = {
+  id: "rn_test",
+  orgId: "org",
+  userId: "user",
+  name: "laptop",
+  enrolledAt: "2026-09-08T00:00:00.000Z",
+  fingerprint: "f".repeat(64),
+  logins: ["codex", "claude"] as readonly string[],
+} as unknown as import("../src/runners/registry").LiveRunner;
+
+describe("local runner binding", () => {
+  test("a thread placed on the machine runs there, with logins only when the org allows them; nothing else picks a machine", async () => {
+    const built: string[] = [];
+    const seam = (allowLocalExecution: boolean, allowLocalLogins: boolean) => ({
+      onlineForUser: (orgId: string, userId: string) => (orgId === "org" && userId === "user" ? runnerStub : null),
+      runner: (id: string) => (id === "rn_test" ? runnerStub : null),
+      policy: async () => ({ allowLocalExecution, allowLocalLogins }),
+    });
+    const deps = {
+      env: {},
+      envProvider: () => envBinding,
+      providers: { local: () => { built.push("local"); return fakeProvider("local"); } },
+      runners: seam(true, true),
+    };
+    const local = { orgId: "org", userId: "user", runLocation: "local" as const };
+    const binding = await resolveSandboxBindingForRun(local, deps);
+    expect(binding).toMatchObject({ kind: "local", credential: "user", userId: "user", snapshot: null, connectionUpdatedAt: "2026-09-08T00:00:00.000Z", logins: ["codex", "claude"] });
+    expect(built).toEqual(["local"]);
+    // Logins are lent only with the org's say-so; no hosted binding carries any.
+    expect((await resolveSandboxBindingForRun(local, { ...deps, runners: seam(true, false) })).logins).toEqual([]);
+    expect(bindingSnapshot(binding, "DAYTONA_SNAPSHOT")).toBe("");
+    // No choice, or the cloud, is the server's provider even while the machine is
+    // connected: the plane never places a run on a machine nobody chose.
+    expect((await resolveSandboxBindingForRun({ orgId: "org", userId: "user" }, deps)).credential).toBe("env");
+    expect((await resolveSandboxBindingForRun({ ...local, runLocation: null }, deps)).credential).toBe("env");
+    expect((await resolveSandboxBindingForRun({ ...local, runLocation: "cloud" }, deps)).credential).toBe("env");
+    // Asked for the machine, a user without one, the org switch off, or the
+    // deployment kill switch fail plainly; nothing falls back to the cloud.
+    await expect(resolveSandboxBindingForRun({ ...local, userId: "other" }, deps)).rejects.toBeInstanceOf(MachineNotConnectedError);
+    await expect(resolveSandboxBindingForRun({ ...local, userId: null }, deps)).rejects.toBeInstanceOf(MachineNotConnectedError);
+    await expect(resolveSandboxBindingForRun(local, { ...deps, runners: seam(false, true) })).rejects.toBeInstanceOf(LocalExecutionDisabledError);
+    await expect(resolveSandboxBindingForRun(local, { ...deps, env: { LOCAL_RUNNERS: "off" } })).rejects.toBeInstanceOf(LocalExecutionDisabledError);
+  });
+
+  test("a recorded local sandbox resolves to its machine even while it is away", async () => {
+    const { cookies, orgId } = await createOrgSession("binding-local-user");
+    const userId = await userIdForCookies(cookies);
+    const seam = {
+      onlineForUser: () => null,
+      runner: (id: string) => (id === "rn_test" ? { ...runnerStub, orgId, userId } as typeof runnerStub : null),
+      policy: async () => ({ allowLocalExecution: true, allowLocalLogins: true }),
+    };
+    const deps = { env: {}, envProvider: () => envBinding, providers: { local: () => fakeProvider("local") }, runners: seam };
+    const created = await json<{ id: string }>("/api/runs", { method: "POST", cookies, body: { prompt: "Local work.", engine: "mock" } });
+    expect(created.status).toBe(201);
+    await setRunSandbox(created.body.id, "local:rn_test:c1", { kind: "local", credential: "user" });
+    expect((await resolveSandboxBindingForThread(orgId, created.body.id, deps)).kind).toBe("local");
+    expect((await resolveSandboxBindingForSandbox("local:rn_test:c1", deps)).kind).toBe("local");
+    // A machine that was un-enrolled cannot be resolved; nothing falls back to the server's account.
+    const gone = { ...deps, runners: { ...seam, runner: () => null } };
+    await expect(resolveSandboxBindingForSandbox("local:rn_test:c1", gone)).rejects.toThrow(/no longer enrolled/);
+    // The switches apply to retained sandboxes too; the record stays, nothing falls back.
+    await expect(resolveSandboxBindingForSandbox("local:rn_test:c1", { ...deps, env: { LOCAL_RUNNERS: "off" } })).rejects.toThrow(/switched off/);
+    const forbidden = { ...deps, runners: { ...seam, policy: async () => ({ allowLocalExecution: false, allowLocalLogins: true }) } };
+    await expect(resolveSandboxBindingForThread(orgId, created.body.id, forbidden)).rejects.toThrow(/switched off/);
+  });
+});
+
+describe("sandbox binding", () => {
+  test("env binding builds the provider selected by the injected environment", () => {
+    const previous = process.env.SANDBOX_PROVIDER;
+    process.env.SANDBOX_PROVIDER = "daytona";
+    try {
+      const binding = envSandboxBinding({ SANDBOX_PROVIDER: "cube", CUBE_API_KEY: "cube_injected" });
+      expect(binding?.kind).toBe("cube");
+      expect(binding?.provider.constructor.name).toBe("CubeProvider");
+    } finally {
+      if (previous === undefined) delete process.env.SANDBOX_PROVIDER;
+      else process.env.SANDBOX_PROVIDER = previous;
+    }
+  });
+
+  test("USER_COMPUTERS is off by default and the server's provider is the fallback", async () => {
+    expect(userComputersEnabled({})).toBe(false);
+    expect(userComputersEnabled({ USER_COMPUTERS: "on" })).toBe(true);
+    const binding = await resolveSandboxBindingForRun(
+      { orgId: "org", userId: "user" },
+      { env: {}, envProvider: () => envBinding, connections: async () => { throw new Error("must not be consulted"); } },
+    );
+    expect(binding).toBe(envBinding);
+    await expect(resolveSandboxBindingForRun({ orgId: "org", userId: "user" }, { env: {}, envProvider: () => null }))
+      .rejects.toThrow(/credentials are unavailable/);
+    expect(bindingSnapshot({ ...envBinding, kind: "box" }, "DAYTONA_SNAPSHOT")).toBeDefined();
+  });
+
+  test("a connected personal computer runs the user's work, most recently updated connection first", async () => {
+    const { cookies, orgId } = await createOrgSession("binding-user");
+    const userId = await userIdForCookies(cookies);
+    const app = new Hono<AppEnv>().route(
+      "/api/provider-connections",
+      createProviderConnectionsRoutes({ validateCredential: async () => {} }),
+    );
+    const put = (provider: string, body: Record<string, unknown>) =>
+      app.request(`/api/provider-connections/${provider}/api-key`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", cookie: cookies },
+        body: JSON.stringify(body),
+      });
+    expect((await put("daytona", { apiKey: "dtn_user", metadata: { snapshotName: "my-daytona-snap" } })).status).toBe(200);
+    expect((await put("box", { apiKey: "box_user", metadata: { snapshotName: "my-box-snap" } })).status).toBe(200);
+
+    const built: string[] = [];
+    const deps = {
+      env: { USER_COMPUTERS: "on", DAYTONA_API_KEY: "daytona_server" },
+      envProvider: () => envBinding,
+      providers: {
+        box: (key: string) => { built.push(`box:${key}`); return fakeProvider("box"); },
+        daytona: (key: string) => { built.push(`daytona:${key}`); return fakeProvider("daytona"); },
+      },
+    };
+    const binding = await resolveSandboxBindingForRun({ orgId, userId }, deps);
+    expect(binding.kind).toBe("box");
+    expect(binding.credential).toBe("user");
+    expect(binding.snapshot).toBe("my-box-snap");
+    expect(built).toEqual(["box:box_user"]);
+    expect(bindingSnapshot(binding, "DAYTONA_SNAPSHOT")).toBe("my-box-snap");
+
+    // Off for the org: same user, same connections, server provider.
+    expect((await resolveSandboxBindingForRun({ orgId, userId }, { ...deps, env: {} })).credential).toBe("env");
+    // A different user in the org has no connection: server provider.
+    expect((await resolveSandboxBindingForRun({ orgId, userId: "someone-else" }, deps)).credential).toBe("env");
+
+    // The run records who made its sandbox; later touches resolve the same provider.
+    const created = await json<{ id: string }>("/api/runs", { method: "POST", cookies, body: { prompt: "Work.", engine: "mock" } });
+    expect(created.status).toBe(201);
+    await setRunSandbox(created.body.id, "bx_user_1", { kind: binding.kind, credential: binding.credential });
+    const byThread = await resolveSandboxBindingForThread(orgId, created.body.id, deps);
+    expect(byThread.kind).toBe("box");
+    expect(byThread.credential).toBe("user");
+    const bySandbox = await resolveSandboxBindingForSandbox("bx_user_1", deps);
+    expect(bySandbox.kind).toBe("box");
+
+    // Revoking the connection makes those touches fail loudly instead of falling back to the server's account.
+    const revoked = await fetchApi("/api/provider-connections/box/revoke?authMethod=api_key", { method: "POST", cookies });
+    expect(revoked.status).toBe(200);
+    await expect(resolveSandboxBindingForThread(orgId, created.body.id, deps)).rejects.toThrow(/revoked/);
+
+    // A sandbox recorded as the server's stays the server's even with a personal connection present.
+    const serverRun = await json<{ id: string }>("/api/runs", { method: "POST", cookies, body: { prompt: "Server work.", engine: "mock" } });
+    await setRunSandbox(serverRun.body.id, "srv_1", { kind: "daytona", credential: "env" });
+    expect((await resolveSandboxBindingForSandbox("srv_1", deps)).credential).toBe("env");
+    // Runs from before this record (no binding columns) also resolve to the server's provider.
+    const legacyRun = await json<{ id: string }>("/api/runs", { method: "POST", cookies, body: { prompt: "Legacy.", engine: "mock" } });
+    await setRunSandbox(legacyRun.body.id, "legacy_1");
+    expect((await resolveSandboxBindingForSandbox("legacy_1", deps)).credential).toBe("env");
+  });
+
+  test("a collaborator reuses the personal computer owner's credential, not the reply actor's", async () => {
+    const orgId = `org-binding-owner-${crypto.randomUUID()}`;
+    const ownerId = `owner-${crypto.randomUUID()}`;
+    const collaboratorId = `collaborator-${crypto.randomUUID()}`;
+    const rootRunId = crypto.randomUUID();
+    const replyRunId = crypto.randomUUID();
+    const sandboxId = `box-${crypto.randomUUID()}`;
+    const rootCreatedAt = new Date("2026-09-05T06:00:00.000Z");
+    const replyCreatedAt = new Date("2026-09-05T06:00:01.000Z");
+    const resolvedUsers: string[] = [];
+    const deps = {
+      env: { USER_COMPUTERS: "on" },
+      connections: async ({ userId }: { orgId: string; userId: string }) => [{
+        provider: "box",
+        authMethod: "api_key",
+        status: "connected",
+        updatedAt: new Date("2026-09-05T05:00:00.000Z"),
+        metadata: {},
+        userId,
+      }] as never,
+      credential: async ({ userId }: { orgId: string; userId: string }) => {
+        resolvedUsers.push(userId);
+        return userId === ownerId
+          ? { authMethod: "api_key", value: "owner-test-credential" } as never
+          : null;
+      },
+      providers: { box: () => fakeProvider("owner-box") },
+      envProvider: () => envBinding,
+    };
+
+    await createRun({
+      id: rootRunId,
+      prompt: "Create the retained workspace.",
+      model: "mock-model",
+      engine: "mock",
+      orgId,
+      userId: ownerId,
+      parentRunId: null,
+      threadId: rootRunId,
+      repos: [],
+      memoryScope: "org",
+    });
+    await db.update(runs).set({ createdAt: rootCreatedAt }).where(eq(runs.id, rootRunId));
+    await setRunSandbox(rootRunId, sandboxId, { kind: "box", credential: "user" });
+
+    const firstBinding = await resolveSandboxBindingForThread(orgId, rootRunId, deps);
+    expect(firstBinding.userId).toBe(ownerId);
+
+    await createRun({
+      id: replyRunId,
+      prompt: "Continue in the retained workspace.",
+      model: "mock-model",
+      engine: "mock",
+      orgId,
+      userId: collaboratorId,
+      parentRunId: rootRunId,
+      threadId: rootRunId,
+      repos: [],
+      memoryScope: "org",
+    });
+    await db.update(runs).set({ createdAt: replyCreatedAt }).where(eq(runs.id, replyRunId));
+    await setRunSandbox(replyRunId, sandboxId, { kind: "box", credential: "user" });
+
+    resolvedUsers.length = 0;
+    expect((await resolveSandboxBindingForThread(orgId, rootRunId, deps)).userId).toBe(ownerId);
+    expect((await resolveSandboxBindingForSandbox(sandboxId, deps)).userId).toBe(ownerId);
+    expect(resolvedUsers).toEqual([ownerId, ownerId]);
+
+    expect(await clearThreadSandbox(orgId, rootRunId, sandboxId)).toBe(2);
+    const mappings = await db
+      .select({ id: runs.id, sandboxId: runs.sandboxId })
+      .from(runs)
+      .where(eq(runs.threadId, rootRunId));
+    expect(mappings).toEqual(expect.arrayContaining([
+      { id: rootRunId, sandboxId: null },
+      { id: replyRunId, sandboxId: null },
+    ]));
+  });
+
+  test("an unscoped sandbox lookup fails closed when two organizations recorded the same id", async () => {
+    const sandboxId = `shared-${crypto.randomUUID()}`;
+    for (const orgId of [`org-a-${crypto.randomUUID()}`, `org-b-${crypto.randomUUID()}`]) {
+      const runId = crypto.randomUUID();
+      await createRun({
+        id: runId,
+        prompt: "Ambiguous provider id.",
+        model: "mock-model",
+        engine: "mock",
+        orgId,
+        userId: crypto.randomUUID(),
+        parentRunId: null,
+        threadId: runId,
+        repos: [],
+        memoryScope: "org",
+      });
+      await setRunSandbox(runId, sandboxId, { kind: "box", credential: "user" });
+    }
+
+    await expect(resolveSandboxBindingForSandbox(sandboxId, { envProvider: () => envBinding }))
+      .rejects.toThrow(/shared by multiple organizations/);
+  });
+
+  test("retained env sandboxes keep their recorded provider when the deployment default changes", async () => {
+    const { cookies } = await createOrgSession("binding-retained-env");
+    const createRun = async (prompt: string) => {
+      const created = await json<{ id: string }>("/api/runs", { method: "POST", cookies, body: { prompt, engine: "mock" } });
+      expect(created.status).toBe(201);
+      return created.body.id;
+    };
+    const built: string[] = [];
+    let defaultProviderCalls = 0;
+    const providers = {
+      cube: (key: string) => { built.push(`cube:${key}`); return fakeProvider("cube"); },
+      daytona: (key: string) => { built.push(`daytona:${key}`); return fakeProvider("daytona"); },
+    };
+
+    const daytonaRun = await createRun("Recorded Daytona.");
+    await setRunSandbox(daytonaRun, "dtn_retained", { kind: "daytona", credential: "env" });
+    const recordedDaytona = await resolveSandboxBindingForSandbox("dtn_retained", {
+      env: { SANDBOX_PROVIDER: "cube", CUBE_API_KEY: "cube_current", DAYTONA_API_KEY: "daytona_recorded" },
+      envProvider: () => { defaultProviderCalls += 1; return { ...envBinding, kind: "cube" }; },
+      providers,
+    });
+    expect(recordedDaytona.kind).toBe("daytona");
+    expect(recordedDaytona.credential).toBe("env");
+    expect(built).toEqual(["daytona:daytona_recorded"]);
+    expect(defaultProviderCalls).toBe(0);
+
+    built.length = 0;
+    const cubeRun = await createRun("Recorded Cube.");
+    await setRunSandbox(cubeRun, "cube_retained", { kind: "cube", credential: "env" });
+    const recordedCube = await resolveSandboxBindingForSandbox("cube_retained", {
+      env: { SANDBOX_PROVIDER: "daytona", DAYTONA_API_KEY: "daytona_current", CUBE_API_KEY: "cube_recorded" },
+      envProvider: () => { defaultProviderCalls += 1; return envBinding; },
+      providers,
+    });
+    expect(recordedCube.kind).toBe("cube");
+    expect(built).toEqual(["cube:cube_recorded"]);
+    expect(defaultProviderCalls).toBe(0);
+
+    built.length = 0;
+    await expect(resolveSandboxBindingForSandbox("dtn_retained", {
+      env: { SANDBOX_PROVIDER: "cube", CUBE_API_KEY: "cube_current" },
+      envProvider: () => { defaultProviderCalls += 1; return { ...envBinding, kind: "cube" }; },
+      providers,
+    })).rejects.toThrow(/credentials are unavailable for recorded daytona sandbox/);
+    expect(built).toEqual([]);
+    expect(defaultProviderCalls).toBe(0);
+
+    const legacyRun = await createRun("Legacy binding.");
+    await setRunSandbox(legacyRun, "legacy_retained");
+    const legacyDefault = { ...envBinding, kind: "cube" as const };
+    const legacy = await resolveSandboxBindingForSandbox("legacy_retained", {
+      env: { SANDBOX_PROVIDER: "cube", CUBE_API_KEY: "cube_current" },
+      envProvider: () => { defaultProviderCalls += 1; return legacyDefault; },
+      providers,
+    });
+    expect(legacy).toBe(legacyDefault);
+    expect(defaultProviderCalls).toBe(1);
+  });
+
+  test("the restricted gateway resolves personal computers through its filtered credential view", async () => {
+    const built: string[] = [];
+    const binding = await resolveSandboxBindingForRun(
+      { orgId: "org", userId: "user" },
+      {
+        env: {
+          USER_COMPUTERS: "on",
+          GATEWAY_DATABASE_URL: "postgres://restricted",
+        },
+        envProvider: () => envBinding,
+        gatewayConnection: async ({ orgId, userId, providers }) => {
+          expect({ orgId, userId, providers }).toEqual({
+            orgId: "org",
+            userId: "user",
+            providers: ["daytona", "box"],
+          });
+          return {
+            provider: "box",
+            value: "box_gateway_key",
+            metadata: { snapshotName: "box-snapshot" },
+          };
+        },
+        providers: {
+          box: (key: string) => {
+            built.push(key);
+            return fakeProvider("box-gateway");
+          },
+        },
+      },
+    );
+
+    expect(binding).toMatchObject({
+      kind: "box",
+      credential: "user",
+      snapshot: "box-snapshot",
+      userId: "user",
+    });
+    expect(built).toEqual(["box_gateway_key"]);
+  });
+
+  test("the hosted gateway role can read computer metadata through the filtered view and label trust anchor", async () => {
+    const { cookies, orgId } = await createOrgSession("binding-gateway-role");
+    const userId = await userIdForCookies(cookies);
+    const app = new Hono<AppEnv>().route(
+      "/api/provider-connections",
+      createProviderConnectionsRoutes({ validateCredential: async () => {} }),
+    );
+    const saved = await app.request(
+      "/api/provider-connections/box/api-key",
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json", cookie: cookies },
+        body: JSON.stringify({
+          apiKey: "box_restricted_view",
+          metadata: { snapshotName: "native-desktop" },
+        }),
+      },
+    );
+    expect(saved.status).toBe(200);
+
+    const roles = await db.execute(sql`
+      select rolname from pg_roles
+      where rolname in ('useagent_gateway', 'skynet_gateway')
+      order by (rolname = 'useagent_gateway') desc
+      limit 1
+    `);
+    const role = roles[0]?.rolname;
+    if (typeof role !== "string") return;
+
+    const rows = await db.transaction(async (tx) => {
+      await tx.execute(sql.raw(`set local role "${role}"`));
+      await tx.execute(sql`select sandbox_id from sandbox_labels limit 0`);
+      return tx.execute(sql`
+        select provider, metadata
+        from gateway_provider_api_key_credentials
+        where org_id = ${orgId}
+          and user_id = ${userId}
+          and provider = 'box'
+      `);
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      provider: "box",
+      metadata: { snapshotName: "native-desktop" },
+    });
+  });
+
+  test("reconciling the deployment provider's listing leaves personal-computer mappings alone", async () => {
+    const { cookies } = await createOrgSession("binding-reconcile");
+    const serverRun = await json<{ id: string }>("/api/runs", { method: "POST", cookies, body: { prompt: "Server.", engine: "mock" } });
+    const userRun = await json<{ id: string }>("/api/runs", { method: "POST", cookies, body: { prompt: "Personal.", engine: "mock" } });
+    await setRunSandbox(serverRun.body.id, "srv_gone", { kind: "daytona", credential: "env" });
+    await setRunSandbox(userRun.body.id, "bx_personal", { kind: "box", credential: "user" });
+
+    // The deployment provider's authoritative listing returned neither id (everything else stays live).
+    const others = (await listCurrentRetainedSandboxMappings()).map((m) => m.sandboxId).filter((id) => id !== "srv_gone" && id !== "bx_personal");
+    await clearMissingRetainedSandboxMappings(new Set(others), "daytona");
+
+    const [server] = await db.select({ sandboxId: runs.sandboxId }).from(runs).where(eq(runs.id, serverRun.body.id));
+    const [personal] = await db.select({ sandboxId: runs.sandboxId }).from(runs).where(eq(runs.id, userRun.body.id));
+    expect(server?.sandboxId).toBeNull();
+    expect(personal?.sandboxId).toBe("bx_personal");
+  });
+});

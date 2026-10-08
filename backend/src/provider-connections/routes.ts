@@ -1,0 +1,273 @@
+import { Hono, type Context, type MiddlewareHandler } from "hono";
+import type { AppEnv } from "../http";
+import { orgScope } from "../middleware/org";
+import { catalogAccount, providerOfferedTo, providerOfferedToUser } from "../provider-gateway/provider-accounts";
+import {
+  cancelManagedCodexChatGptLogin,
+  readManagedCodexChatGptStatus,
+  readManagedCodexRateLimits,
+  revokeManagedCodexChatGptLogin,
+  startManagedCodexChatGptLogin,
+  type CodexAppServerLoginStartResult,
+  type CodexChatGptStatus,
+  type CodexRateLimits,
+} from "./codex-app-server";
+import {
+  getCurrentUserProviderConnection,
+  listCurrentUserProviderConnections,
+  revokeCurrentUserProviderConnection,
+  upsertApiKeyProviderConnection,
+  type ProviderConnectionMeta,
+} from "./service";
+import { type SandboxCredentialInput, isSandboxCredentialError } from "@useagent/sandbox-contract";
+import { sandboxPlugin } from "../sandboxes/plugins";
+import { COMPUTER_PROVIDER_KINDS, type ComputerProviderKind } from "../sandboxes/binding";
+import { operatorOnly, requestFromOperator } from "../operator/access";
+import {
+  isProviderConnectionAuthMethod,
+  isProviderConnectionProvider,
+  readBoxConnectionMetadata,
+  readDaytonaConnectionMetadata,
+  readModelProviderMetadata,
+  type ProviderConnectionAuthMethod,
+} from "./types";
+
+export interface CodexChatGptOAuthLifecycle {
+  start(input: {
+    scope: { orgId: string; userId: string };
+    loginMethod?: "chatgpt" | "device_code";
+  }): Promise<CodexAppServerLoginStartResult>;
+  status(input: {
+    scope: { orgId: string; userId: string };
+  }): Promise<CodexChatGptStatus>;
+  limits(input: {
+    scope: { orgId: string; userId: string };
+  }): Promise<CodexRateLimits | null>;
+  cancel(input: {
+    scope: { orgId: string; userId: string };
+    loginId: string;
+  }): Promise<{ status: string }>;
+  revoke(input: {
+    scope: { orgId: string; userId: string };
+  }): Promise<ProviderConnectionMeta | null>;
+}
+
+const defaultCodexChatGptOAuthLifecycle: CodexChatGptOAuthLifecycle = {
+  start: startManagedCodexChatGptLogin,
+  status: readManagedCodexChatGptStatus,
+  limits: readManagedCodexRateLimits,
+  cancel: cancelManagedCodexChatGptLogin,
+  revoke: revokeManagedCodexChatGptLogin,
+};
+
+export function createProviderConnectionsRoutes(input: {
+  codexChatGptOAuth?: CodexChatGptOAuthLifecycle;
+  /** Test seam: computer-provider credential validation (default: the provider plugin's). */
+  validateCredential?: (kind: ComputerProviderKind, input: SandboxCredentialInput) => Promise<void>;
+} = {}): Hono<AppEnv> {
+  const providerConnectionsRoutes = new Hono<AppEnv>();
+  const codexChatGptOAuth = input.codexChatGptOAuth ?? defaultCodexChatGptOAuthLifecycle;
+  const validateCredential =
+    input.validateCredential ??
+    (async (kind: ComputerProviderKind, credential: SandboxCredentialInput) => {
+      const validate = sandboxPlugin(kind).validateCredential;
+      if (!validate) throw new Error(`${kind} does not support stored credentials`);
+      await validate(credential);
+    });
+
+  providerConnectionsRoutes.use("*", orgScope);
+
+  // Sandbox vendor accounts (Daytona, Box) are the operator's business: for
+  // anyone else those routes do not exist and the list leaves them out. A
+  // stored connection keeps running its owner's work either way.
+  const computerKinds: readonly string[] = COMPUTER_PROVIDER_KINDS;
+  const operatorOnlyComputers: MiddlewareHandler<AppEnv> = (c, next) =>
+    computerKinds.includes(c.req.param("provider") ?? "") ? operatorOnly(c, next) : next();
+  providerConnectionsRoutes.use("/:provider", operatorOnlyComputers);
+  providerConnectionsRoutes.use("/:provider/*", operatorOnlyComputers);
+
+  function requireUserScope(c: Context<AppEnv>) {
+    const userId = c.get("userId");
+    if (!userId) return null;
+    return { orgId: c.get("orgId"), userId };
+  }
+
+  providerConnectionsRoutes.get("/", async (c) => {
+    const scope = requireUserScope(c);
+    if (!scope) return c.json({ error: "user_required" }, 403);
+    // A provider PROVIDER_ACCOUNTS withholds from this account has no card here.
+    const connections = await listCurrentUserProviderConnections(scope);
+    const operator = await requestFromOperator(c);
+    const account = await catalogAccount(scope.userId);
+    return c.json({
+      connections: connections.filter(
+        (item) =>
+          (operator || !computerKinds.includes(item.provider)) && providerOfferedTo(item.provider, account),
+      ),
+    });
+  });
+
+  providerConnectionsRoutes.post("/openai/chatgpt-oauth/start", async (c) => {
+    const scope = requireUserScope(c);
+    if (!scope) return c.json({ error: "user_required" }, 403);
+    // Hosted connections cannot receive Codex's loopback browser callback. Keep
+    // this server-side invariant so stale clients cannot restart that flow.
+    const login = await codexChatGptOAuth.start({ scope, loginMethod: "device_code" });
+    return c.json({ login });
+  });
+
+  providerConnectionsRoutes.get("/openai/chatgpt-oauth/status", async (c) => {
+    const scope = requireUserScope(c);
+    if (!scope) return c.json({ error: "user_required" }, 403);
+    const status = await codexChatGptOAuth.status({ scope });
+    return c.json({ status });
+  });
+
+  // The subscription's rolling usage windows for the Usage card; null when
+  // no ChatGPT account is signed in for this user.
+  providerConnectionsRoutes.get("/openai/chatgpt-oauth/limits", async (c) => {
+    const scope = requireUserScope(c);
+    if (!scope) return c.json({ error: "user_required" }, 403);
+    const limits = await codexChatGptOAuth.limits({ scope });
+    return c.json({ limits });
+  });
+
+  providerConnectionsRoutes.post("/openai/chatgpt-oauth/cancel", async (c) => {
+    const scope = requireUserScope(c);
+    if (!scope) return c.json({ error: "user_required" }, 403);
+    let body: Record<string, unknown>;
+    try {
+      body = await c.req.json() as Record<string, unknown>;
+    } catch {
+      return c.json({ error: "invalid JSON body" }, 400);
+    }
+    const loginId = typeof body.loginId === "string" ? body.loginId : "";
+    if (!loginId) return c.json({ error: "loginId is required" }, 400);
+    const result = await codexChatGptOAuth.cancel({ scope, loginId });
+    return c.json(result);
+  });
+
+  providerConnectionsRoutes.post("/openai/chatgpt-oauth/revoke", async (c) => {
+    const scope = requireUserScope(c);
+    if (!scope) return c.json({ error: "user_required" }, 403);
+    const connection = await codexChatGptOAuth.revoke({ scope });
+    if (!connection) return c.json({ error: "provider connection not found" }, 404);
+    return c.json({ connection });
+  });
+
+  providerConnectionsRoutes.get("/:provider", async (c) => {
+    const provider = c.req.param("provider");
+    if (!isProviderConnectionProvider(provider)) {
+      return c.json({ error: "unknown provider" }, 400);
+    }
+    if (!(await providerOfferedToUser(provider, c.get("userId")))) {
+      return c.json({ error: "provider connection not found" }, 404);
+    }
+    const authMethod = c.req.query("authMethod");
+    let parsedAuthMethod: ProviderConnectionAuthMethod | undefined;
+    if (authMethod !== undefined) {
+      if (!isProviderConnectionAuthMethod(authMethod)) {
+        return c.json({ error: "unknown auth method" }, 400);
+      }
+      parsedAuthMethod = authMethod;
+    }
+    const scope = requireUserScope(c);
+    if (!scope) return c.json({ error: "user_required" }, 403);
+    const connection = await getCurrentUserProviderConnection({
+      ...scope,
+      provider,
+      authMethod: parsedAuthMethod,
+    });
+    if (!connection) return c.json({ error: "provider connection not found" }, 404);
+    return c.json({ connection });
+  });
+
+  providerConnectionsRoutes.put("/:provider/api-key", async (c) => {
+    const provider = c.req.param("provider");
+    if (!isProviderConnectionProvider(provider)) {
+      return c.json({ error: "unknown provider" }, 400);
+    }
+    if (!(await providerOfferedToUser(provider, c.get("userId")))) {
+      return c.json({ error: "provider connection not found" }, 404);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: "invalid JSON body" }, 400);
+    }
+
+    const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+    if (!apiKey) return c.json({ error: "apiKey is required" }, 400);
+    if (apiKey.length > 8_192) return c.json({ error: "apiKey is too long" }, 400);
+
+    const scope = requireUserScope(c);
+    if (!scope) return c.json({ error: "user_required" }, 403);
+
+    const daytonaMetadata = provider === "daytona"
+      ? readDaytonaConnectionMetadata(body.metadata)
+      : null;
+    if (provider === "daytona" && !daytonaMetadata) {
+      return c.json({ error: "valid Daytona snapshotName is required" }, 400);
+    }
+    const boxMetadata = provider === "box" ? readBoxConnectionMetadata(body.metadata) : null;
+    if (provider === "box" && !boxMetadata) {
+      return c.json({ error: "Box snapshotName must be a valid snapshot name" }, 400);
+    }
+    const metadata = daytonaMetadata ?? boxMetadata ?? readModelProviderMetadata(body.metadata);
+    if (provider === "box" || provider === "daytona") {
+      const snapshotName = (daytonaMetadata?.snapshotName ?? boxMetadata?.snapshotName)?.trim();
+      try {
+        await validateCredential(provider, { apiKey, ...(snapshotName ? { snapshotName } : {}) });
+      } catch (error) {
+        if (isSandboxCredentialError(error)) return c.json({ error: error.code }, error.httpStatus);
+        throw error;
+      }
+    }
+
+    const connection = await upsertApiKeyProviderConnection({
+      ...scope,
+      provider,
+      apiKey,
+      metadata,
+    });
+    return c.json({ connection });
+  });
+
+  providerConnectionsRoutes.post("/:provider/revoke", async (c) => {
+    const provider = c.req.param("provider");
+    if (!isProviderConnectionProvider(provider)) {
+      return c.json({ error: "unknown provider" }, 400);
+    }
+    if (!(await providerOfferedToUser(provider, c.get("userId")))) {
+      return c.json({ error: "provider connection not found" }, 404);
+    }
+    const authMethod = c.req.query("authMethod");
+    let parsedAuthMethod: ProviderConnectionAuthMethod | undefined;
+    if (authMethod !== undefined) {
+      if (!isProviderConnectionAuthMethod(authMethod)) {
+        return c.json({ error: "unknown auth method" }, 400);
+      }
+      parsedAuthMethod = authMethod;
+    }
+    if (provider === "openai" && parsedAuthMethod === undefined) {
+      return c.json({ error: "authMethod is required for openai revoke" }, 400);
+    }
+    const scope = requireUserScope(c);
+    if (!scope) return c.json({ error: "user_required" }, 403);
+    const connection = provider === "openai" && parsedAuthMethod === "chatgpt_oauth"
+      ? await codexChatGptOAuth.revoke({ scope })
+      : await revokeCurrentUserProviderConnection({
+          ...scope,
+          provider,
+          authMethod: parsedAuthMethod,
+        });
+    if (!connection) return c.json({ error: "provider connection not found" }, 404);
+    return c.json({ connection });
+  });
+
+  return providerConnectionsRoutes;
+}
+
+export const providerConnectionsRoutes = createProviderConnectionsRoutes();

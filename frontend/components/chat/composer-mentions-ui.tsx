@@ -1,0 +1,793 @@
+"use client";
+
+
+import {
+  RiArrowLeftLine,
+  RiArrowRightSLine,
+  RiChat3Line,
+  RiCloseLine,
+  RiErrorWarningLine,
+  RiFileLine,
+  RiFlashlightLine,
+  RiRobot2Line,
+  RiFolder3Line,
+  RiGitPullRequestLine,
+  RiLoader4Line,
+} from "@remixicon/react";
+import {
+  type ReactNode,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useState,
+} from "react";
+import type { BotState } from "@useagent/agent-client";
+import { botStatus } from "@/components/bots/bot-status";
+import { StatusDot } from "@/components/shared/status-dot";
+import { useCapabilityCatalog } from "@/hooks/use-capability-catalog";
+import { cx as cn } from "@/utils/cx";
+import {
+  detectMentionTrigger,
+  botMention,
+  fileMention,
+  insertMentionToken,
+  type Mention,
+  type MentionKind,
+  mentionKey,
+  mentionsReducer,
+  parseDraftMentions,
+  prMention,
+  removeMentionToken,
+  skillMention,
+  threadMention,
+} from "./composer-mentions";
+import {
+  type MentionSkill,
+  type Resource,
+  IDLE,
+  type ThreadItem,
+  type PullItem,
+  type RepoItem,
+  type TreeItem,
+  type BotItem,
+  fetchThreads,
+  fetchPulls,
+  fetchBots,
+  fetchRepos,
+  fetchTree,
+  orderRepos,
+  fetchSkillsPicker,
+} from "@/components/chat/composer-mentions-data";
+import { MentionRowMark } from "./mention-row-mark";
+export type { MentionSkill } from "@/components/chat/composer-mentions-data";
+export { repoTreeUrl } from "@/components/chat/composer-mentions-data";
+export type { Mention } from "./composer-mentions";
+// Re-export the submit-side helpers the composers need, so a composer wires the
+// whole feature from this one module.
+export { mentionsToRunResources } from "./composer-mentions";
+
+// ---------------------------------------------------------------------------
+// The "@" mention popover + chips, shared by the reply composer and the new-task
+// composer (see composer-mentions.ts for the pure token/reference/reducer logic).
+// Honest v1: a plain textarea, so a mention is a text token PLUS a removable chip;
+// data is drilled category -> searchable list, matched to real backend endpoints
+// (skills, run summaries, pulls, and the repo tree browse endpoint).
+// ---------------------------------------------------------------------------
+
+
+
+const CATEGORIES: {
+  kind: MentionKind;
+  label: string;
+  description: string;
+  icon: typeof RiFolder3Line;
+}[] = [
+  { kind: "file", label: "Files", description: "Files in the project's repositories", icon: RiFolder3Line },
+  { kind: "pr", label: "Pull requests", description: "Open and recent pull requests", icon: RiGitPullRequestLine },
+  { kind: "thread", label: "Threads", description: "Reference another thread", icon: RiChat3Line },
+  { kind: "skill", label: "Skills", description: "Skills available to the agent", icon: RiFlashlightLine },
+  { kind: "bot", label: "Bots", description: "Hand part of this to a bot", icon: RiRobot2Line },
+];
+
+const CATEGORY_LABEL: Record<MentionKind, string> = {
+  file: "Files",
+  pr: "Pull requests",
+  thread: "Threads",
+  skill: "Skills",
+  bot: "Bots",
+};
+
+type MentionView =
+  | { level: "root" }
+  | { level: "list"; kind: "skill" | "thread" | "pr" | "bot" }
+  | { level: "files"; repo: string | null; revision: string | null; dir: string };
+
+type MentionRow =
+  | { type: "category"; kind: MentionKind; label: string; description: string }
+  | { type: "skill"; id: string; name: string; tag?: string }
+  | { type: "thread"; id: string; title: string; meta: string }
+  | { type: "pr"; repo: string; number: number; title: string }
+  | { type: "repo"; full_name: string; private: boolean }
+  | { type: "dir"; path: string; name: string }
+  | { type: "file"; path: string; name: string }
+  | { type: "bot"; id: string; name: string; title: string; state: BotState; avatarTone: string; avatarIcon: string };
+
+export type UseComposerMentions = {
+  mentions: Mention[];
+  open: boolean;
+  /** Bots exist in this org, so "@ ... a bot" is an honest hint. */
+  botsAvailable: boolean;
+  /** ARIA wiring for the textarea combobox while the popover is open. */
+  listboxId: string;
+  activeOptionId: string | undefined;
+  onTextareaKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  onTextareaSelect: (e: React.SyntheticEvent<HTMLTextAreaElement>) => void;
+  /** Append an "@" and open straight on the Bots list (the "+" menu row). */
+  openBots: () => void;
+  clear: () => void;
+  chips: ReactNode;
+  popover: ReactNode;
+};
+
+const LISTBOX_ID = "mention-listbox";
+export const mentionOptionId = (index: number): string => `mention-option-${index}`;
+const DRAFT_KEY_PREFIX = "useagent.draft-mentions.";
+
+function readDraftMentions(draftKey: string | null | undefined): Mention[] {
+  if (!draftKey || typeof window === "undefined") return [];
+  return parseDraftMentions(window.localStorage.getItem(`${DRAFT_KEY_PREFIX}${draftKey}`));
+}
+
+/**
+ * The composer "@" mention controller. Owns the popover view/highlight state, the
+ * structured mention records, data fetching per drilled category, and keyboard
+ * nav; returns ready-to-drop `chips` and `popover` nodes plus the textarea
+ * handlers so each composer's wiring stays tiny.
+ *
+ * The structured records (the chips) persist alongside the textarea draft under
+ * `draftKey`, so a reload keeps the typed binding (a bot handoff, a pinned file
+ * revision) and not just the visible token text.
+ */
+export function useComposerMentions(opts: {
+  value: string;
+  onValueChange: (v: string) => void;
+  containerRef: RefObject<HTMLElement | null>;
+  enabled?: boolean;
+  skills?: readonly MentionSkill[];
+  selectedRepos?: readonly string[];
+  repoRevisions?: Readonly<Record<string, string | null>>;
+  /** Popover opens above the composer ("top", reply) or below it ("bottom", new task). */
+  placement?: "top" | "bottom";
+  /** Same key the composer persists its text draft under; chips ride along. */
+  draftKey?: string | null;
+}): UseComposerMentions {
+  const { value, onValueChange, containerRef, enabled = true, skills, selectedRepos, repoRevisions, draftKey } = opts;
+  const placement = opts.placement ?? "top";
+
+  const [mentions, dispatch] = useReducer(mentionsReducer, draftKey, readDraftMentions);
+  useEffect(() => {
+    if (!draftKey || typeof window === "undefined") return;
+    const key = `${DRAFT_KEY_PREFIX}${draftKey}`;
+    if (mentions.length > 0) window.localStorage.setItem(key, JSON.stringify(mentions));
+    else window.localStorage.removeItem(key);
+  }, [draftKey, mentions]);
+  const [caret, setCaret] = useState(0);
+  const [dismissed, setDismissed] = useState(false);
+  const [view, setView] = useState<MentionView>({ level: "root" });
+  const [highlight, setHighlight] = useState(0);
+  const [pendingCaret, setPendingCaret] = useState<number | null>(null);
+
+  const [threads, setThreads] = useState<Resource<ThreadItem>>(IDLE);
+  const [pulls, setPulls] = useState<Resource<PullItem>>(IDLE);
+  const [repos, setRepos] = useState<Resource<RepoItem>>(IDLE);
+  const [tree, setTree] = useState<Resource<TreeItem>>(IDLE);
+  const [fetchedSkills, setFetchedSkills] = useState<Resource<MentionSkill>>(IDLE);
+  const [bots, setBots] = useState<Resource<BotItem>>(IDLE);
+  const { catalog } = useCapabilityCatalog();
+  const showBots = catalog?.bots === true;
+
+  const trigger = enabled ? detectMentionTrigger(value, caret) : null;
+  const open = trigger !== null && !dismissed;
+  const query = trigger?.query ?? "";
+
+  // Typing (a value change) always re-arms the popover after an Escape dismiss,
+  // and re-reads the caret from the DOM. The `select` event alone is not a
+  // reliable per-keystroke caret signal across browsers, so this makes typing
+  // "@" open the popover regardless (onTextareaSelect still covers arrow/click
+  // caret moves that do not change the value).
+  useEffect(() => {
+    setDismissed(false);
+    if (pendingCaret != null) return; // an insert owns the caret this cycle
+    const ta = containerRef.current?.querySelector("textarea");
+    if (ta && (typeof document === "undefined" || document.activeElement === ta)) {
+      setCaret(ta.selectionStart ?? 0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+
+  // Apply a caret move after a token insert (once React has painted the new text).
+  useLayoutEffect(() => {
+    if (pendingCaret == null) return;
+    const ta = containerRef.current?.querySelector("textarea");
+    if (ta) {
+      ta.focus();
+      ta.setSelectionRange(pendingCaret, pendingCaret);
+    }
+    setPendingCaret(null);
+  }, [pendingCaret, containerRef]);
+
+  // Lazily load the data for whichever category/level is open.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const load = async <T,>(
+      set: (r: Resource<T>) => void,
+      fetcher: () => Promise<T[]>,
+    ) => {
+      set({ status: "loading", items: [] });
+      try {
+        const items = await fetcher();
+        if (!cancelled) set({ status: "ready", items });
+      } catch {
+        if (!cancelled) set({ status: "error", items: [] });
+      }
+    };
+    if (view.level === "list" && view.kind === "thread") void load(setThreads, fetchThreads);
+    else if (view.level === "list" && view.kind === "pr") void load(setPulls, fetchPulls);
+    else if (view.level === "list" && view.kind === "bot") void load(setBots, fetchBots);
+    else if (view.level === "list" && view.kind === "skill" && !skills)
+      void load(setFetchedSkills, fetchSkillsPicker);
+    else if (view.level === "files" && view.repo === null) void load(setRepos, fetchRepos);
+    else if (view.level === "files" && view.repo !== null) {
+      const repo = view.repo;
+      const revision = view.revision;
+      const dir = view.dir;
+      void load(setTree, () => fetchTree(repo, revision, dir));
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [open, view, skills]);
+
+  const skillItems = skills ?? fetchedSkills.items;
+
+  const { rows, status } = useMemo(
+    () =>
+      computeRows({
+        view,
+        query,
+        skillItems,
+        bots,
+        showBots,
+        skillStatus: skills ? "ready" : fetchedSkills.status,
+        threads,
+        pulls,
+        repos: { ...repos, items: orderRepos(repos.items, selectedRepos) },
+        tree,
+      }),
+    [view, query, skillItems, skills, fetchedSkills.status, threads, pulls, repos, tree, selectedRepos, bots, showBots],
+  );
+
+  const insertMention = useCallback(
+    (m: Mention) => {
+      if (!trigger) return;
+      const next = insertMentionToken(value, trigger.start, caret, m.token);
+      onValueChange(next.text);
+      dispatch({ type: "add", mention: m });
+      setView({ level: "root" });
+      setHighlight(0);
+      setCaret(next.caret);
+      setPendingCaret(next.caret);
+    },
+    [trigger, value, caret, onValueChange],
+  );
+
+  const activate = useCallback(
+    (index: number) => {
+      const row = rows[index];
+      if (!row) return;
+      if (row.type === "category") {
+        setView(row.kind === "file" ? { level: "files", repo: null, revision: null, dir: "" } : { level: "list", kind: row.kind });
+        setHighlight(0);
+      } else if (row.type === "skill") insertMention(skillMention(row.id, row.name));
+      else if (row.type === "thread") insertMention(threadMention(row.id, row.title));
+      else if (row.type === "pr") insertMention(prMention(row.repo, row.number, row.title));
+      else if (row.type === "bot") {
+        insertMention(botMention(row.id, row.name, row.avatarTone, row.avatarIcon));
+      }
+      else if (row.type === "repo") {
+        const repo = repos.items.find((item) => item.full_name === row.full_name);
+        setView({
+          level: "files",
+          repo: row.full_name,
+          revision: repoRevisions?.[row.full_name] ?? repo?.default_branch ?? null,
+          dir: "",
+        });
+        setHighlight(0);
+      } else if (row.type === "dir" && view.level === "files") {
+        setView({ ...view, dir: row.path });
+        setHighlight(0);
+      } else if (row.type === "file" && view.level === "files" && view.repo) {
+        insertMention(fileMention(view.repo, row.path, view.revision));
+      }
+    },
+    [rows, insertMention, view, repos.items, repoRevisions],
+  );
+
+  const goBack = useCallback(() => {
+    setHighlight(0);
+    // In a subdirectory, climb one level; at a repo root or a list, return to root.
+    if (view.level === "files" && view.repo !== null && view.dir !== "") {
+      const parentDir = view.dir.includes("/") ? view.dir.split("/").slice(0, -1).join("/") : "";
+      setView({ ...view, dir: parentDir });
+    } else {
+      setView({ level: "root" });
+    }
+  }, [view]);
+
+  const onTextareaKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (!open) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setDismissed(true);
+        return;
+      }
+      const count = rows.length;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (count) setHighlight((h) => (h + 1) % count);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (count) setHighlight((h) => (h - 1 + count) % count);
+      } else if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        if (count) activate(Math.min(highlight, count - 1));
+      }
+    },
+    [open, rows.length, highlight, activate],
+  );
+
+  const onTextareaSelect = useCallback((e: React.SyntheticEvent<HTMLTextAreaElement>) => {
+    setCaret(e.currentTarget.selectionStart ?? 0);
+  }, []);
+
+  const removeMention = useCallback(
+    (m: Mention) => {
+      dispatch({ type: "remove", key: mentionKey(m) });
+      onValueChange(removeMentionToken(value, m.token));
+    },
+    [onValueChange, value],
+  );
+
+  const clear = useCallback(() => dispatch({ type: "clear" }), []);
+
+  const openBots = useCallback(() => {
+    const next = value === "" || /\s$/.test(value) ? `${value}@` : `${value} @`;
+    onValueChange(next);
+    setDismissed(false);
+    setView({ level: "list", kind: "bot" });
+    setHighlight(0);
+    setCaret(next.length);
+    setPendingCaret(next.length);
+  }, [value, onValueChange]);
+
+  const chips = <MentionChips mentions={mentions} onRemove={removeMention} />;
+  const popover = open ? (
+    <MentionPopover
+      view={view}
+      rows={rows}
+      status={status}
+      query={query}
+      highlight={highlight}
+      placement={placement}
+      onHover={setHighlight}
+      onActivate={activate}
+      onBack={goBack}
+    />
+  ) : null;
+
+  return {
+    mentions,
+    open,
+    botsAvailable: showBots,
+    listboxId: LISTBOX_ID,
+    activeOptionId: open && rows.length > 0 ? mentionOptionId(Math.min(highlight, rows.length - 1)) : undefined,
+    onTextareaKeyDown,
+    onTextareaSelect,
+    openBots,
+    clear,
+    chips,
+    popover,
+  };
+}
+
+function includesQuery(haystack: string, q: string): boolean {
+  return haystack.toLowerCase().includes(q.toLowerCase());
+}
+
+const ROW_CAP = 50;
+
+function computeRows(input: {
+  view: MentionView;
+  query: string;
+  skillItems: readonly MentionSkill[];
+  skillStatus: Resource<unknown>["status"];
+  threads: Resource<ThreadItem>;
+  pulls: Resource<PullItem>;
+  repos: Resource<RepoItem>;
+  tree: Resource<TreeItem>;
+  bots: Resource<BotItem>;
+  showBots: boolean;
+}): { rows: MentionRow[]; status: Resource<unknown>["status"] } {
+  const { view, query } = input;
+  if (view.level === "root") {
+    return {
+      rows: CATEGORIES.filter((c) => c.kind !== "bot" || input.showBots).map((c) => ({
+        type: "category" as const,
+        kind: c.kind,
+        label: c.label,
+        description: c.description,
+      })),
+      status: "ready",
+    };
+  }
+  if (view.level === "list" && view.kind === "skill") {
+    const rows = input.skillItems
+      .filter((s) => includesQuery(s.name, query) || (s.tag ? includesQuery(s.tag, query) : false))
+      .slice(0, ROW_CAP)
+      .map((s) => ({ type: "skill" as const, id: s.id, name: s.name, tag: s.tag }));
+    return { rows, status: input.skillStatus };
+  }
+  if (view.level === "list" && view.kind === "bot") {
+    const rows = input.bots.items
+      .filter((b) => includesQuery(b.name, query) || includesQuery(b.title, query))
+      .slice(0, ROW_CAP)
+      .map((b) => ({ type: "bot" as const, ...b }));
+    return { rows, status: input.bots.status };
+  }
+  if (view.level === "list" && view.kind === "thread") {
+    const rows = input.threads.items
+      .filter((t) => includesQuery(t.title, query))
+      .slice(0, ROW_CAP)
+      .map((t) => ({ type: "thread" as const, id: t.id, title: t.title, meta: t.meta }));
+    return { rows, status: input.threads.status };
+  }
+  if (view.level === "list" && view.kind === "pr") {
+    const rows = input.pulls.items
+      .filter((p) => includesQuery(`${p.repo}#${p.number} ${p.title}`, query))
+      .slice(0, ROW_CAP)
+      .map((p) => ({ type: "pr" as const, repo: p.repo, number: p.number, title: p.title }));
+    return { rows, status: input.pulls.status };
+  }
+  // files: repo picker, then directory-by-directory browse
+  if (view.level === "files" && view.repo === null) {
+    const rows = input.repos.items
+      .filter((r) => includesQuery(r.full_name, query))
+      .slice(0, ROW_CAP)
+      .map((r) => ({ type: "repo" as const, full_name: r.full_name, private: r.private }));
+    return { rows, status: input.repos.status };
+  }
+  const rows = input.tree.items
+    .filter((e) => includesQuery(e.name, query))
+    .slice(0, ROW_CAP)
+    .map((e) =>
+      e.type === "dir"
+        ? ({ type: "dir", path: e.path, name: e.name } as const)
+        : ({ type: "file", path: e.path, name: e.name } as const),
+    );
+  return { rows, status: input.tree.status };
+}
+
+// ---------------------------------------------------------------------------
+// Chips (removable, above the composer).
+// ---------------------------------------------------------------------------
+
+function chipIcon(kind: MentionKind) {
+  switch (kind) {
+    case "skill":
+      return RiFlashlightLine;
+    case "bot":
+      return RiRobot2Line;
+    case "thread":
+      return RiChat3Line;
+    case "pr":
+      return RiGitPullRequestLine;
+    case "file":
+      return RiFileLine;
+  }
+}
+
+function chipLabel(m: Mention): string {
+  switch (m.kind) {
+    case "skill":
+    case "bot":
+      return m.name;
+    case "thread":
+      return `thread/${m.shortId}`;
+    case "pr":
+      return `${m.repo}#${m.number}`;
+    case "file":
+      return m.path.split("/").pop() ?? m.path;
+  }
+}
+
+function MentionChips({
+  mentions,
+  onRemove,
+}: {
+  mentions: readonly Mention[];
+  onRemove: (m: Mention) => void;
+}) {
+  if (mentions.length === 0) return null;
+  return (
+    <ul className="flex flex-wrap gap-1.5 px-1 pb-1.5" aria-label="Referenced context">
+      {mentions.map((m) => {
+        const Icon = chipIcon(m.kind);
+        return (
+          <li
+            key={mentionKey(m)}
+            className="border-border-button-default bg-background-secondary-default text-text-secondary inline-flex max-w-full items-center gap-1.5 rounded-lg border px-2 py-1 text-caption-1-medium"
+          >
+            <MentionRowMark
+              bot={m.kind === "bot" ? m : undefined}
+              icon={Icon}
+            />
+            <span className="max-w-52 truncate" title={m.token}>
+              {chipLabel(m)}
+            </span>
+            <button
+              type="button"
+              aria-label={`Remove ${chipLabel(m)}`}
+              onClick={() => onRemove(m)}
+              className="hover:text-text-primary -my-1 -mr-1 flex size-6 shrink-0 items-center justify-center rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring"
+            >
+              <RiCloseLine className="size-3.5" aria-hidden />
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Popover (BoardUI dropdown/command styling, mirrors SlashCommandPopover).
+// ---------------------------------------------------------------------------
+
+function rowIcon(row: MentionRow) {
+  switch (row.type) {
+    case "category":
+      return CATEGORIES.find((c) => c.kind === row.kind)?.icon ?? RiFileLine;
+    case "skill":
+      return RiFlashlightLine;
+    case "bot":
+      return RiRobot2Line;
+    case "thread":
+      return RiChat3Line;
+    case "pr":
+      return RiGitPullRequestLine;
+    case "repo":
+    case "dir":
+      return RiFolder3Line;
+    case "file":
+      return RiFileLine;
+  }
+}
+
+function rowPrimary(row: MentionRow): string {
+  switch (row.type) {
+    case "category":
+      return row.label;
+    case "skill":
+    case "bot":
+      return row.name;
+    case "thread":
+      return row.title;
+    case "pr":
+      return `${row.repo}#${row.number}`;
+    case "repo":
+      return row.full_name;
+    case "dir":
+    case "file":
+      return row.name;
+  }
+}
+
+function rowSecondary(row: MentionRow): string | undefined {
+  switch (row.type) {
+    case "category":
+      return row.description;
+    case "skill":
+      return row.tag;
+    case "bot":
+      return row.title || undefined;
+    case "thread":
+      return row.meta;
+    case "pr":
+      return row.title || undefined;
+    case "repo":
+      return row.private ? "Private" : "Public";
+    default:
+      return undefined;
+  }
+}
+
+/** A bot row's second line: its live state from /api/bots, then its title. */
+function BotStateCaption({ row }: { row: Extract<MentionRow, { type: "bot" }> }) {
+  const state = botStatus(row.state);
+  return (
+    <span className="flex items-center gap-1 text-caption-1-regular text-text-tertiary">
+      <StatusDot tone={state.dotTone} pulse={state.pulse} />
+      <span className="truncate">{[state.label, row.title || null].filter(Boolean).join(" · ")}</span>
+    </span>
+  );
+}
+
+const EMPTY_TEXT: Record<string, string> = {
+  skill: "No matching skills.",
+  thread: "No matching threads.",
+  pr: "No matching pull requests.",
+  bot: "No matching bots.",
+  files: "No matching files.",
+};
+
+function statusText(view: MentionView, status: Resource<unknown>["status"]): string | null {
+  if (status === "loading") return "Loading...";
+  if (status === "error") return "Couldn't load - keep typing to send as text.";
+  const key = view.level === "files" ? "files" : view.level === "list" ? view.kind : "";
+  return EMPTY_TEXT[key] ?? "No results.";
+}
+
+function MentionPopover({
+  view,
+  rows,
+  status,
+  query,
+  highlight,
+  placement,
+  onHover,
+  onActivate,
+  onBack,
+}: {
+  view: MentionView;
+  rows: MentionRow[];
+  status: Resource<unknown>["status"];
+  query: string;
+  highlight: number;
+  placement: "top" | "bottom";
+  onHover: (index: number) => void;
+  onActivate: (index: number) => void;
+  onBack: () => void;
+}) {
+  const atRoot = view.level === "root";
+  const header =
+    view.level === "root"
+      ? "Add context"
+      : view.level === "list"
+        ? CATEGORY_LABEL[view.kind]
+        : view.repo === null
+          ? "Select a repository"
+          : `${view.repo}${view.dir ? `:${view.dir}` : ""}`;
+  const showStatusRow = rows.length === 0;
+
+  return (
+    <div
+      className={cn(
+        "absolute left-0 z-30 w-full",
+        placement === "top" ? "bottom-full mb-2" : "top-full mt-2",
+      )}
+    >
+      <div className="border-border-button-default bg-background-primary-default shadow-dropdown w-full rounded-2xl border p-2">
+        <div className="flex items-center gap-1.5 px-1 pb-1 pt-0.5">
+          {!atRoot && (
+            <button
+              type="button"
+              aria-label="Back"
+              // mousedown (not click) so the textarea keeps focus.
+              onMouseDown={(e) => {
+                e.preventDefault();
+                onBack();
+              }}
+              className="text-text-secondary hover:bg-background-primary-hover -my-0.5 -ml-1 flex size-6 items-center justify-center rounded"
+            >
+              <RiArrowLeftLine className="size-4" aria-hidden />
+            </button>
+          )}
+          <p className="text-mono-label text-text-tertiary min-w-0 flex-1 truncate" id="mention-label">
+            {header}
+          </p>
+          {query && (
+            <span className="text-caption-1-regular text-text-tertiary shrink-0 font-mono">@{query}</span>
+          )}
+        </div>
+        <div className="max-h-72 overflow-y-auto" role="listbox" id={LISTBOX_ID} aria-labelledby="mention-label">
+          {showStatusRow ? (
+            <p
+              className={cn(
+                "px-2 py-2 text-caption-1-regular",
+                status === "error" ? "text-text-error-primary" : "text-text-tertiary",
+              )}
+              role={status === "error" ? "alert" : "status"}
+            >
+              {status === "error" ? (
+                <span className="flex items-center gap-1.5">
+                  <RiErrorWarningLine className="size-3.5 shrink-0" aria-hidden />
+                  {statusText(view, status)}
+                </span>
+              ) : status === "loading" ? (
+                <span className="flex items-center gap-1.5">
+                  <RiLoader4Line className="size-3.5 shrink-0 animate-spin" aria-hidden />
+                  {statusText(view, status)}
+                </span>
+              ) : (
+                statusText(view, status)
+              )}
+            </p>
+          ) : (
+            rows.map((row, i) => {
+              const Icon = rowIcon(row);
+              const secondary = rowSecondary(row);
+              const drills = row.type === "category" || row.type === "repo" || row.type === "dir";
+              return (
+                <button
+                  key={rowKey(row, i)}
+                  id={mentionOptionId(i)}
+                  type="button"
+                  role="option"
+                  aria-selected={i === highlight}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    onActivate(i);
+                  }}
+                  onMouseEnter={() => onHover(i)}
+                  className={cn(
+                    "flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition-colors",
+                    i === highlight
+                      ? "bg-dropdown-item-hover-background ring-2 ring-inset ring-border-focus-ring"
+                      : "hover:bg-background-primary-hover",
+                  )}
+                >
+                  <MentionRowMark bot={row.type === "bot" ? row : undefined} icon={Icon} />
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span className="text-body-2-medium text-text-primary truncate">{rowPrimary(row)}</span>
+                    {row.type === "bot" ? (
+                      <BotStateCaption row={row} />
+                    ) : secondary ? (
+                      <span className="text-caption-1-regular text-text-tertiary truncate">{secondary}</span>
+                    ) : null}
+                  </span>
+                  {drills && (
+                    <RiArrowRightSLine className="text-foreground-icon-tertiary size-4 shrink-0" aria-hidden />
+                  )}
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function rowKey(row: MentionRow, index: number): string {
+  switch (row.type) {
+    case "category":
+      return `cat-${row.kind}`;
+    case "skill":
+      return `skill-${row.id}`;
+    case "bot":
+      return `bot-${row.id}`;
+    case "thread":
+      return `thread-${row.id}`;
+    case "pr":
+      return `pr-${row.repo}#${row.number}`;
+    case "repo":
+      return `repo-${row.full_name}`;
+    default:
+      return `path-${row.path}-${index}`;
+  }
+}

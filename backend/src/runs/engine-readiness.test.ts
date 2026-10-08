@@ -1,0 +1,375 @@
+import { beforeEach, describe, expect, test } from "bun:test";
+import { freeModelLaneCache } from "./free-model-lane";
+import {
+  configuredEngineReadiness,
+  configuredUserFacingEngines,
+  configuredDefaultRunEngine,
+  engineModelReadyForDispatch,
+  engineModelsForConfiguredEngines,
+  engineModelsForReadyEngines,
+  engineReadyForDispatch,
+  engineReadiness,
+  modelProviderReadyForEngine,
+  modelProviderReadinessErrorBody,
+  persistedEngineModelReadyForDispatch,
+  readyUserFacingEngines,
+  resolveAcceptedEngine,
+} from "./engine-readiness";
+
+const PROD = {
+  NODE_ENV: "production",
+  USEAGENT_DEV_MODE: "false",
+  GATEWAY_PUBLIC_URL: "https://gateway.example.test",
+  PROVIDER_GATEWAY_SECRET: "readiness-test-provider-gateway-secret-0123456789",
+} as const;
+
+
+// These tests read the Free lane's cold boot state (the seed). Other suites in the
+// same process adopt published lanes into the shared cache, so start from the seed.
+beforeEach(() => freeModelLaneCache.reset());
+
+describe("engine readiness advertisement", () => {
+  test("a sandbox engine is not ready without a wired provider gateway", () => {
+    const proven = {
+      ...PROD,
+      ENABLED_ENGINES: "opencode,codex",
+      ENGINE_READINESS_OPENCODE: "verified",
+      ENGINE_READINESS_CODEX: "verified",
+      PROVIDER_HEALTH_OPENAI: "verified",
+      PROVIDER_HEALTH_OPENROUTER: "verified",
+    };
+    expect(engineReadiness("opencode", proven)).toMatchObject({ ready: true, reason: "enabled" });
+
+    const unwired = { ...proven, GATEWAY_PUBLIC_URL: "", PROVIDER_GATEWAY_PUBLIC_URL: "" };
+    const readiness = engineReadiness("opencode", unwired);
+    expect(readiness).toMatchObject({ ready: false, reason: "gateway_unconfigured" });
+    expect(readiness.message).toContain("GATEWAY_PUBLIC_URL");
+    // Chat needs no gateway, so it is the only engine left standing.
+    expect(readyUserFacingEngines(unwired)).toEqual(["chat"]);
+    expect(resolveAcceptedEngine("codex", unwired)).toMatchObject({
+      ok: false,
+      status: 403,
+      error: "engine_not_ready",
+      reason: "gateway_unconfigured",
+    });
+    expect(engineReadyForDispatch("codex", unwired)).toBe(false);
+
+    // A URL without the signing secret is just as unusable as no URL.
+    expect(engineReadiness("codex", { ...proven, PROVIDER_GATEWAY_SECRET: "" })).toMatchObject({
+      ready: false,
+      reason: "gateway_unconfigured",
+    });
+    // Chat never touches a sandbox, so it does not need the gateway.
+    expect(engineReadiness("chat", unwired)).toMatchObject({ ready: true });
+  });
+
+  test("advertises no-sandbox chat without any deployment key, unless it is turned off", () => {
+    expect(readyUserFacingEngines(PROD)).toEqual(["chat"]);
+    expect(engineReadiness("chat", PROD)).toMatchObject({ ready: true, reason: "enabled" });
+    expect(readyUserFacingEngines({ ...PROD, CHAT: "off" })).not.toContain("chat");
+    expect(engineReadiness("chat", { ...PROD, CHAT: "off" })).toMatchObject({ ready: false });
+
+    const configured = PROD;
+    expect(engineModelsForReadyEngines(configured).chat).toContain(
+      "anthropic/claude-sonnet-5",
+    );
+  });
+
+  test("raw ENABLED_ENGINES is not enough to advertise an unproven Claude engine", () => {
+    const env = {
+      ...PROD,
+      ENABLED_ENGINES: "claude,codex",
+      T3_RUN_ADAPTER_ENABLED: "true",
+      T3_RUN_ADAPTER_MODE: "all",
+      T3_RUN_ADAPTER_ENGINES: "codex,opencode",
+    };
+
+    expect(readyUserFacingEngines(env)).toEqual(["chat"]);
+    expect(engineReadiness("claude", env)).toMatchObject({
+      ready: false,
+      reason: "not_proven",
+    });
+  });
+
+  test("engine and provider both require positive release evidence", () => {
+    const engineOnly = {
+      ...PROD,
+      ENABLED_ENGINES: "codex",
+      ENGINE_READINESS_CODEX: "verified",
+    };
+    expect(engineReadiness("codex", engineOnly)).toMatchObject({
+      ready: false,
+      reason: "not_proven",
+    });
+    expect(engineReadiness("codex", {
+      ...engineOnly,
+      PROVIDER_HEALTH_OPENAI: "verified",
+    })).toMatchObject({ ready: true, reason: "enabled" });
+  });
+
+  test("Pi is hidden until its native bridge and selected provider are proven", () => {
+    const engineOnly = {
+      ...PROD,
+      ENABLED_ENGINES: "pi",
+      ENGINE_READINESS_PI: "verified",
+    };
+    expect(engineReadiness("pi", engineOnly)).toMatchObject({
+      ready: false,
+      reason: "not_proven",
+    });
+    expect(engineReadiness("pi", {
+      ...engineOnly,
+      PROVIDER_HEALTH_OPENAI: "verified",
+    })).toMatchObject({ ready: true, reason: "enabled" });
+  });
+
+  test("subscription-backed Codex requires engine proof but not an API-key provider", () => {
+    const env = {
+      ...PROD,
+      ENABLED_ENGINES: "codex",
+      ENGINE_READINESS_CODEX: "verified",
+      ENGINE_AUTH_MODE_CODEX: "subscription",
+    };
+
+    expect(engineReadiness("codex", env)).toMatchObject({
+      ready: true,
+      reason: "enabled",
+    });
+    expect(modelProviderReadyForEngine("codex", "gpt-5.6-sol", env)).toBe(true);
+    expect(engineModelReadyForDispatch("codex", "gpt-5.6-sol", env)).toBe(true);
+  });
+
+  test("hybrid and provider-gateway Codex retain paid-provider readiness", () => {
+    const base = {
+      ...PROD,
+      ENABLED_ENGINES: "codex",
+      ENGINE_READINESS_CODEX: "verified",
+    };
+
+    expect(engineReadiness("codex", { ...base, ENGINE_AUTH_MODE_CODEX: "hybrid" }))
+      .toMatchObject({ ready: false, reason: "not_proven" });
+    expect(engineReadiness("codex", {
+      ...base,
+      ENGINE_AUTH_MODE_CODEX: "provider_gateway",
+    })).toMatchObject({ ready: false, reason: "not_proven" });
+  });
+
+  test("unknown or inapplicable auth modes fail closed", () => {
+    const proven = {
+      ...PROD,
+      ENABLED_ENGINES: "codex,opencode",
+      ENGINE_READINESS_CODEX: "verified",
+      ENGINE_READINESS_OPENCODE: "verified",
+      PROVIDER_HEALTH_OPENAI: "verified",
+      PROVIDER_HEALTH_OPENROUTER: "verified",
+    };
+
+    expect(engineReadiness("codex", {
+      ...proven,
+      ENGINE_AUTH_MODE_CODEX: "mystery",
+    })).toMatchObject({ ready: false, reason: "not_proven" });
+    expect(engineReadiness("opencode", {
+      ...proven,
+      ENGINE_AUTH_MODE_OPENCODE: "subscription",
+    })).toMatchObject({ ready: false, reason: "not_proven" });
+  });
+
+  test("provider health failure removes a previously ready engine", () => {
+    const env = {
+      ...PROD,
+      ENABLED_ENGINES: "claude",
+      ENGINE_READINESS_CLAUDE: "verified",
+      PROVIDER_HEALTH_ANTHROPIC: "401",
+    };
+
+    expect(engineReadiness("claude", env)).toMatchObject({
+      ready: false,
+      reason: "provider_unhealthy",
+    });
+    expect(readyUserFacingEngines(env)).toEqual(["chat"]);
+    expect(configuredUserFacingEngines(env)).toContain("claude");
+    expect(configuredEngineReadiness(env).claude).toMatchObject({
+      ready: false,
+      reason: "provider_unhealthy",
+      provider: "anthropic",
+      providerHealth: "401",
+    });
+
+    const creditFailure = resolveAcceptedEngine("claude", {
+      ...env,
+      PROVIDER_HEALTH_ANTHROPIC: "insufficient_credit",
+    });
+    expect(creditFailure).toMatchObject({
+      ok: false,
+      error: "engine_not_ready",
+      provider: "anthropic",
+      providerHealth: "insufficient_credit",
+    });
+    expect(creditFailure.ok ? "" : creditFailure.message).toContain("Add credits");
+  });
+
+  test("provider models require explicit positive health", () => {
+    const models = engineModelsForReadyEngines({
+      ...PROD,
+      ENGINE_READINESS_OPENCODE: "verified",
+      PROVIDER_HEALTH_ANTHROPIC: "invalid",
+      PROVIDER_HEALTH_OPENAI: "verified",
+      PROVIDER_HEALTH_OPENROUTER: "verified",
+    });
+
+    expect(Object.keys(models).sort()).toEqual(["chat", "opencode"]);
+    expect(models.opencode).toEqual([
+      "openai/gpt-5.6-sol",
+      "openai/gpt-5.6-luna",
+      "openai/gpt-5.6-terra",
+      "moonshotai/kimi-k3",
+      "deepseek/deepseek-v4-flash",
+      "google/gemini-3.7-flash",
+      "minimax/minimax-m3:free",
+      "dots-studio/dots-3-note-preview:free",
+      "nvidia/nemotron-3-super-120b-a12b:free",
+    ]);
+  });
+
+  test("explicit model switches cannot bypass provider readiness", () => {
+    const env = {
+      ...PROD,
+      ENABLED_ENGINES: "opencode",
+      ENGINE_READINESS_OPENCODE: "verified",
+      PROVIDER_HEALTH_ANTHROPIC: "401",
+      PROVIDER_HEALTH_OPENAI: "verified",
+      PROVIDER_HEALTH_OPENROUTER: "401",
+    };
+
+    expect(modelProviderReadyForEngine("opencode", "claude-opus-5", env)).toBe(false);
+    expect(modelProviderReadyForEngine("opencode", "openai/gpt-5.6-sol", env)).toBe(true);
+    expect(engineModelReadyForDispatch("opencode", "claude-opus-5", env)).toBe(false);
+    expect(engineModelReadyForDispatch("opencode", "openai/gpt-5.6-sol", env)).toBe(true);
+    expect(engineModelReadyForDispatch("opencode", "made-up/provider-model", env)).toBe(false);
+    expect(engineModelReadyForDispatch("opencode", "cerebras/qwen-3.8-27b", {
+      ...env,
+      PROVIDER_HEALTH_CEREBRAS: "verified",
+    })).toBe(true);
+    // An OpenCode Zen free model needs Zen's own release evidence.
+    expect(modelProviderReadyForEngine("opencode", "opencode/big-pickle:free", env)).toBe(false);
+    expect(modelProviderReadyForEngine("opencode", "opencode/big-pickle:free", {
+      ...env,
+      PROVIDER_HEALTH_OPENCODE: "verified",
+    })).toBe(true);
+    expect(engineModelsForConfiguredEngines(env).opencode).not.toContain("claude-opus-5");
+    expect(modelProviderReadinessErrorBody("opencode", "claude-opus-5", env)).toMatchObject({
+      error: "model_provider_not_ready",
+      provider: "anthropic",
+      providerHealth: "401",
+    });
+    expect(
+      persistedEngineModelReadyForDispatch("opencode", "rotated/model:free", {
+        ...env,
+        PROVIDER_HEALTH_OPENROUTER: "verified",
+      }),
+    ).toBe(true);
+    expect(
+      persistedEngineModelReadyForDispatch("opencode", "rotated/model:free", env),
+    ).toBe(false);
+  });
+});
+
+describe("engine acceptance", () => {
+  test("development keeps the internal omitted-engine mock flow", () => {
+    expect(resolveAcceptedEngine(undefined, { NODE_ENV: "test" })).toEqual({
+      ok: true,
+      engine: "mock",
+    });
+  });
+
+  test("production omitted engine resolves only an honest configured real default", () => {
+    const withoutDefault = resolveAcceptedEngine(undefined, PROD);
+    expect(withoutDefault).toEqual({ ok: false, status: 400, error: "engine is required" });
+
+    const withDefault = {
+      ...PROD,
+      DEFAULT_RUN_ENGINE: "codex",
+      ENABLED_ENGINES: "codex",
+      ENGINE_READINESS_CODEX: "verified",
+      PROVIDER_HEALTH_OPENAI: "verified",
+    };
+    expect(configuredDefaultRunEngine(withDefault)).toBe("codex");
+    expect(resolveAcceptedEngine(undefined, withDefault)).toEqual({
+      ok: true,
+      engine: "codex",
+    });
+  });
+
+  test("production explicit mock and not-ready Claude fail closed", () => {
+    expect(resolveAcceptedEngine("mock", PROD)).toEqual({
+      ok: false,
+      status: 403,
+      error: "engine_not_enabled",
+      engine: "mock",
+    });
+    expect(resolveAcceptedEngine("claude", { ...PROD, ENABLED_ENGINES: "claude" })).toMatchObject({
+      ok: false,
+      status: 403,
+      error: "engine_not_ready",
+      engine: "claude",
+      reason: "not_proven",
+    });
+  });
+});
+
+describe("engine dispatch readiness", () => {
+  test("production rejects legacy mock and unproven user-facing rows", () => {
+    expect(engineReadyForDispatch("mock", PROD)).toBe(false);
+    expect(engineReadyForDispatch("claude", { ...PROD, ENABLED_ENGINES: "claude" })).toBe(
+      false,
+    );
+  });
+
+  test("test mode retains mock while production accepts proven engines", () => {
+    expect(engineReadyForDispatch("mock", { NODE_ENV: "test" })).toBe(true);
+    expect(
+      engineReadyForDispatch("codex", {
+        ...PROD,
+        ENABLED_ENGINES: "codex",
+        ENGINE_READINESS_CODEX: "verified",
+        PROVIDER_HEALTH_OPENAI: "verified",
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("readiness remedy text", () => {
+  test("an unproven engine and an unverified provider both name the remedy", () => {
+    expect(engineReadiness("claude", { ...PROD, ENABLED_ENGINES: "claude" }).message)
+      .toBe("Claude Code is configured but not ready. Check its provider connection in Settings, then retry.");
+    expect(engineReadiness("claude", {
+      ...PROD,
+      ENABLED_ENGINES: "claude",
+      ENGINE_READINESS_CLAUDE: "verified",
+    })).toMatchObject({
+      ready: false,
+      reason: "not_proven",
+      provider: "anthropic",
+      message: "Claude Code is configured, but no Anthropic connection is verified. Connect an Anthropic key in Settings, then retry.",
+    });
+  });
+});
+
+describe("PROVIDER_ACCOUNTS and the model catalogs", () => {
+  test("a restricted provider's models leave the catalog of every account it does not list", () => {
+    const ready = { ENABLED_ENGINES: "opencode", PROVIDER_HEALTH_CEREBRAS: "verified" };
+    const env = { ...ready, PROVIDER_ACCOUNTS: "cerebras:owner@example.com" };
+    const all = engineModelsForConfiguredEngines(ready).opencode ?? [];
+    const cerebras = all.filter((model) => model.startsWith("cerebras/"));
+    expect(cerebras.length).toBeGreaterThan(0);
+    const owner = engineModelsForConfiguredEngines(env, "owner@example.com").opencode ?? [];
+    const other = engineModelsForConfiguredEngines(env, "someone@example.com").opencode ?? [];
+    const nobody = engineModelsForConfiguredEngines(env, null).opencode ?? [];
+    for (const model of cerebras) {
+      expect(owner).toContain(model);
+      expect(other).not.toContain(model);
+      expect(nobody).not.toContain(model);
+    }
+    expect(other.filter((model) => !model.startsWith("cerebras/"))).toEqual(all.filter((model) => !model.startsWith("cerebras/")));
+  });
+});

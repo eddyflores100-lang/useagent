@@ -1,0 +1,141 @@
+import { expect, test } from "bun:test";
+import { renderToStaticMarkup } from "react-dom/server";
+import {
+  dismissThreadErrorBannerForSession,
+  getThreadErrorBannerKey,
+  isThreadErrorBannerDismissedForSession,
+  latestTurnFailure,
+  shouldShowThreadErrorBanner,
+  ThreadErrorBanner,
+} from "./thread-error-banner";
+
+test("compact wait-only user cancellation is neutral but observation timeout remains visible", () => {
+  expect(shouldShowThreadErrorBanner("compact-qa",
+    "Stopped by user. Stopped waiting for native compaction, which may still finish.", false)).toBe(false);
+  expect(shouldShowThreadErrorBanner("compact-qa",
+    "Stopped waiting after 10 minutes. Native compaction may still finish.", false)).toBe(true);
+});
+
+test("stays hidden after its current error is dismissed", () => {
+  const bannerKey = getThreadErrorBannerKey("thread-a", "Aborted");
+  dismissThreadErrorBannerForSession(bannerKey);
+
+  expect(
+    shouldShowThreadErrorBanner(
+      "thread-a",
+      "Aborted",
+      isThreadErrorBannerDismissedForSession(bannerKey),
+    ),
+  ).toBe(false);
+});
+
+test("reappears when a new error arrives on the same thread", () => {
+  dismissThreadErrorBannerForSession(getThreadErrorBannerKey("thread-b", "Turn failed"));
+  const newErrorKey = getThreadErrorBannerKey("thread-b", "Provider crashed");
+
+  expect(isThreadErrorBannerDismissedForSession(newErrorKey)).toBe(false);
+  expect(
+    shouldShowThreadErrorBanner(
+      "thread-b",
+      "Provider crashed",
+      isThreadErrorBannerDismissedForSession(newErrorKey),
+    ),
+  ).toBe(true);
+});
+
+test("scopes dismissals to the thread that dismissed them", () => {
+  dismissThreadErrorBannerForSession(getThreadErrorBannerKey("thread-c", "Aborted"));
+  const otherThreadKey = getThreadErrorBannerKey("other-thread", "Aborted");
+
+  expect(isThreadErrorBannerDismissedForSession(otherThreadKey)).toBe(false);
+  expect(
+    shouldShowThreadErrorBanner(
+      "other-thread",
+      "Aborted",
+      isThreadErrorBannerDismissedForSession(otherThreadKey),
+    ),
+  ).toBe(true);
+});
+
+test("never shows a null error and keeps a dismissal across errorless visits", () => {
+  const bannerKey = getThreadErrorBannerKey("thread-d", "Aborted");
+  dismissThreadErrorBannerForSession(bannerKey);
+
+  expect(shouldShowThreadErrorBanner("thread-d", null, false)).toBe(false);
+  expect(isThreadErrorBannerDismissedForSession(bannerKey)).toBe(true);
+  expect(
+    shouldShowThreadErrorBanner(
+      "thread-d",
+      "Aborted",
+      isThreadErrorBannerDismissedForSession(bannerKey),
+    ),
+  ).toBe(false);
+});
+
+test("renders the real run summary as a prominent dismissible alert", () => {
+  const html = renderToStaticMarkup(
+    <ThreadErrorBanner error="Sandbox provisioning failed: quota exceeded" onDismiss={() => {}} />,
+  );
+  expect(html).toContain('data-session-ui="thread-error-banner"');
+  expect(html).toContain('role="alert"');
+  expect(html).toContain("Run failed");
+  expect(html).toContain("Sandbox provisioning failed: quota exceeded");
+  expect(html).toContain('aria-label="Dismiss error"');
+});
+
+test("shows the whole reason, never clamped, with a copy affordance", () => {
+  // The banner must not hide any of the supplied reason behind a line clamp.
+  const reason =
+    "error: synthetic engine relay stopped during startup after the child process exited before signaling readiness. Diagnostic output remains visible in full so operators can copy the complete failure context.";
+  const html = renderToStaticMarkup(<ThreadErrorBanner error={reason} onDismiss={() => {}} />);
+  expect(html).toContain(reason.replaceAll("'", "&#x27;"));
+  expect(html).not.toContain("line-clamp");
+  expect(html).toContain("whitespace-pre-wrap");
+  expect(html).toContain('data-session-ui="message-copy-button"');
+  expect(html).toContain('aria-label="Copy error"');
+});
+
+test("omits Resend when the caller supplies no resend action", () => {
+  const html = renderToStaticMarkup(<ThreadErrorBanner error="Aborted" onDismiss={() => {}} />);
+  expect(html).not.toContain("Resend");
+});
+
+test("offers Resend, disables it while a resend is in flight and shows a refusal", () => {
+  const idle = renderToStaticMarkup(
+    <ThreadErrorBanner error="Aborted" resend={{ onResend: () => {}, pending: false, error: null }} />,
+  );
+  expect(idle).toContain(">Resend<");
+  expect(idle).not.toContain('disabled=""');
+
+  const pending = renderToStaticMarkup(
+    <ThreadErrorBanner error="Aborted" resend={{ onResend: () => {}, pending: true, error: null }} />,
+  );
+  expect(pending).toContain(">Resending<");
+  expect(pending).toContain('disabled=""');
+
+  const refused = renderToStaticMarkup(
+    <ThreadErrorBanner
+      error="Aborted"
+      resend={{ onResend: () => {}, pending: false, error: "Spend allowance reached" }}
+    />,
+  );
+  expect(refused).toContain("Spend allowance reached");
+});
+
+test("renders nothing for a null error", () => {
+  expect(renderToStaticMarkup(<ThreadErrorBanner error={null} />)).toBe("");
+});
+
+test("the banner belongs to the latest turn only", () => {
+  const failed = {
+    status: "failed",
+    summary: "error: opencode prompt failed (error): The operation was aborted.",
+  };
+  const completed = { status: "completed", summary: "Denied the change and explained why." };
+  expect(latestTurnFailure([completed, failed])).toBe(failed);
+  // A newer successful turn buries the earlier failure: no banner under it.
+  expect(latestTurnFailure([failed, completed])).toBeUndefined();
+  expect(latestTurnFailure([failed, { status: "queued", summary: null }])).toBeUndefined();
+  expect(latestTurnFailure([{ status: "failed", summary: null }])).toBeUndefined();
+  expect(latestTurnFailure([])).toBeUndefined();
+});

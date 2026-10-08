@@ -1,0 +1,705 @@
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import {
+  Sandbox as E2BSandbox,
+  SandboxNotFoundError as E2BSandboxNotFoundError,
+  type SandboxInfo,
+} from "e2b";
+import { SandboxNotFoundError } from "@useagent/sandbox-contract";
+import {
+  classifyCubeReadinessProbe,
+  cubeReadinessProbeCommand,
+  cubeSandboxProvider,
+  describeCubeReadinessFailure,
+} from "./provider";
+
+const originalEnv = { ...process.env };
+/** The control plane supplies the identity probe; these tests only need one that passes or one that checks root. */
+const ready = { identityPreflightCommand: "true" };
+const rootCheck = { identityPreflightCommand: 'test "$(id -u)" = "0"' };
+
+afterEach(() => {
+  process.env = { ...originalEnv };
+});
+
+function sandboxInfo(overrides: Partial<SandboxInfo> = {}): SandboxInfo {
+  return {
+    cpuCount: 2,
+    endAt: new Date(Date.now() + 60_000),
+    envdVersion: "0.6.0",
+    memoryMB: 8192,
+    metadata: { "skynet-run": "run-1" },
+    sandboxId: "cube-1",
+    startedAt: new Date(),
+    state: "running",
+    templateId: "template-1",
+    ...overrides,
+  };
+}
+
+function fakeSandbox(options: {
+  kill?: (pid: number) => Promise<boolean>;
+  list?: () => Promise<Array<{ pid: number; envs: Record<string, string> }>>;
+  onPtyCreate?: (options: unknown) => void;
+  ptySendInput?: (pid: number, data: Uint8Array) => Promise<void>;
+  ptyWait?: () => Promise<{ exitCode: number; error?: string; stdout: string; stderr: string }>;
+  run?: (command: string, options?: unknown) => Promise<unknown>;
+  setTimeout?: (timeoutMs: number) => Promise<void>;
+  write?: (path: string, data: string) => Promise<unknown>;
+} = {}): E2BSandbox {
+  return {
+    setTimeout: options.setTimeout ?? (async () => {}),
+    commands: {
+      kill: options.kill ?? (async () => true),
+      list: options.list ?? (async () => []),
+      run: options.run ?? (async () => ({ exitCode: 0, stderr: "", stdout: "" })),
+    },
+    files: {
+      getInfo: async () => ({ size: 0 }),
+      read: async () => new Uint8Array(),
+      write: options.write ?? (async () => ({ path: "" })),
+    },
+    getHost: (port: number) => `${port}-cube-1.sandbox.example.com`,
+    pty: {
+      create: async (ptyOptions: unknown) => {
+        options.onPtyCreate?.(ptyOptions);
+        return {
+          disconnect: async () => {},
+          exitCode: undefined,
+          error: undefined,
+          kill: async () => true,
+          pid: 42,
+          wait: options.ptyWait ?? (async () => ({ exitCode: 0, stdout: "", stderr: "" })),
+          sendStdin: async () => {
+            throw new Error("CommandHandle.sendStdin must not be used for a PTY");
+          },
+        };
+      },
+      resize: async () => {},
+      sendInput: options.ptySendInput ?? (async () => {}),
+    },
+    sandboxId: "cube-1",
+    trafficAccessToken: "traffic-token",
+  } as unknown as E2BSandbox;
+}
+
+describe("Cube sandbox provider", () => {
+  test("connection identity pins the captured endpoint, proxy namespace, and key", () => {
+    process.env.CUBE_API_URL = "https://cube-api.example.test";
+    process.env.CUBE_SANDBOX_DOMAIN = "sandbox.example.test";
+    process.env.CUBE_PROXY_SCHEME = "https";
+    process.env.CUBE_PROXY_PORT_HTTP = "443";
+    const original = cubeSandboxProvider("fixture-key", ready);
+    const identity = original.connectionFingerprint;
+    expect(identity).toMatch(/^[a-f0-9]{64}$/);
+    expect(cubeSandboxProvider("fixture-key", ready).connectionFingerprint).toBe(identity);
+    expect(cubeSandboxProvider("other-key", ready).connectionFingerprint).not.toBe(identity);
+    process.env.CUBE_API_URL = "https://other-api.example.test";
+    expect(cubeSandboxProvider("fixture-key", ready).connectionFingerprint).not.toBe(identity);
+    expect(original.connectionFingerprint).toBe(identity);
+    process.env.CUBE_API_URL = "https://cube-api.example.test";
+    process.env.CUBE_SANDBOX_DOMAIN = "other-sandbox.example.test";
+    expect(cubeSandboxProvider("fixture-key", ready).connectionFingerprint).not.toBe(identity);
+  });
+
+  test("pins effective SDK fallbacks and rejects newly introduced ambient credentials or targets", async () => {
+    const names = ["E2B_API_KEY", "E2B_ACCESS_TOKEN", "E2B_SANDBOX_URL"] as const;
+    for (const name of names) delete process.env[name];
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const connect = spyOn(E2BSandbox, "connect").mockResolvedValue(fakeSandbox());
+    const kill = spyOn(E2BSandbox, "kill").mockResolvedValue(true);
+    try {
+      for (const name of names) {
+        const anonymous = cubeSandboxProvider("", ready);
+        const originalIdentity = anonymous.connectionFingerprint;
+        const handle = await anonymous.get("cube-1");
+        getInfo.mockClear();
+        kill.mockClear();
+        process.env[name] = name === "E2B_SANDBOX_URL" ? "https://first.example.test" : "first-fixture-value";
+        const captured = cubeSandboxProvider("", ready);
+        expect(captured.connectionFingerprint).not.toBe(originalIdentity);
+        await expect(anonymous.get("cube-1")).rejects.toThrow("Cube SDK connection changed");
+        await expect(handle.delete()).rejects.toThrow("Cube SDK connection changed");
+        expect(getInfo).not.toHaveBeenCalled();
+        expect(kill).not.toHaveBeenCalled();
+        const capturedIdentity = captured.connectionFingerprint;
+        process.env[name] = name === "E2B_SANDBOX_URL" ? "https://second.example.test" : "second-fixture-value";
+        expect(cubeSandboxProvider("", ready).connectionFingerprint).not.toBe(capturedIdentity);
+        await captured.get("cube-1");
+        const options = getInfo.mock.calls.at(-1)?.[1];
+        const field = name === "E2B_API_KEY" ? "apiKey" : name === "E2B_ACCESS_TOKEN" ? "accessToken" : "sandboxUrl";
+        expect(options).toHaveProperty(field, name === "E2B_SANDBOX_URL" ? "https://first.example.test" : "first-fixture-value");
+        delete process.env[name];
+      }
+    } finally {
+      getInfo.mockRestore();
+      connect.mockRestore();
+      kill.mockRestore();
+    }
+  });
+
+  test("translates only missing top-level metadata into the neutral absence error", async () => {
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockRejectedValue(
+      new E2BSandboxNotFoundError("sandbox missing"),
+    );
+
+    await expect(cubeSandboxProvider("", ready).get("cube-missing")).rejects
+      .toBeInstanceOf(SandboxNotFoundError);
+
+    getInfo.mockRestore();
+  });
+
+  test("rejects a different metadata sandbox before connecting or probing it", async () => {
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo({ sandboxId: "foreign-sandbox" }));
+    const connect = spyOn(E2BSandbox, "connect").mockResolvedValue(fakeSandbox());
+    try {
+      await expect(cubeSandboxProvider("fixture-key", ready).get("cube-1")).rejects
+        .toThrow("Cube sandbox metadata identity mismatch");
+      expect(connect).not.toHaveBeenCalled();
+    } finally {
+      getInfo.mockRestore();
+      connect.mockRestore();
+    }
+  });
+
+  test("does not translate an envd not-found after metadata lookup succeeds", async () => {
+    process.env.CUBE_IDENTITY_PROBE_ATTEMPTS = "1";
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const vendorError = new E2BSandboxNotFoundError("envd unavailable");
+    const connect = spyOn(E2BSandbox, "connect").mockRejectedValue(vendorError);
+
+    const error = await cubeSandboxProvider("", ready).get("cube-1").catch((cause) => cause);
+    expect(error).toBe(vendorError);
+    expect(error).not.toBeInstanceOf(SandboxNotFoundError);
+
+    getInfo.mockRestore();
+    connect.mockRestore();
+  });
+
+  test("maps UseAgent create options onto the E2B-compatible Cube API", async () => {
+    process.env.CUBE_API_URL = "http://127.0.0.1:3000";
+    process.env.CUBE_PROXY_SCHEME = "https";
+    process.env.CUBE_SANDBOX_DOMAIN = "sandbox.example.com";
+    const sandbox = fakeSandbox();
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+
+    const handle = await cubeSandboxProvider("cube-key", ready).create({
+      autoStopInterval: 15,
+      envVars: {
+        BASH_ENV: "/tmp/skynet.env",
+        USEAGENT_PROVIDER_GATEWAY_URL: "http://gateway.internal",
+      },
+      labels: { "skynet-run": "run-1" },
+      snapshot: "agent-template",
+    });
+
+    expect(create).toHaveBeenCalledWith(
+      "agent-template",
+      expect.objectContaining({
+        apiKey: "cube-key",
+        apiUrl: "http://127.0.0.1:3000",
+        envs: { USEAGENT_PROVIDER_GATEWAY_URL: "http://gateway.internal" },
+        lifecycle: { autoResume: true, onTimeout: "pause" },
+        metadata: { "skynet-run": "run-1" },
+        network: { allowPublicTraffic: false },
+        secure: true,
+        timeoutMs: 900_000,
+        validateApiKey: false,
+      }),
+    );
+    expect(getInfo).toHaveBeenCalledWith("cube-1", expect.any(Object));
+    expect({ cpu: handle.cpu, id: handle.id, memory: handle.memory, state: handle.state }).toEqual({
+      cpu: 2,
+      id: "cube-1",
+      memory: 8,
+      state: "started",
+    });
+
+    create.mockRestore();
+    getInfo.mockRestore();
+  });
+
+  test("keepAlive sets the sandbox lifetime again from the create option", async () => {
+    process.env.CUBE_API_URL = "http://127.0.0.1:3000";
+    process.env.CUBE_PROXY_SCHEME = "https";
+    process.env.CUBE_SANDBOX_DOMAIN = "sandbox.example.com";
+    const extended: number[] = [];
+    const sandbox = fakeSandbox({ setTimeout: async (timeoutMs) => { extended.push(timeoutMs); } });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    try {
+      const handle = await cubeSandboxProvider("cube-key", ready).create({ autoStopInterval: 15, snapshot: "agent-template" });
+      await handle.keepAlive?.();
+      await handle.keepAlive?.();
+      expect(extended).toEqual([15 * 60_000, 15 * 60_000]);
+    } finally {
+      create.mockRestore();
+      getInfo.mockRestore();
+    }
+  });
+
+  test("a retained sandbox reconnects with its lifetime, not the SDK's 5-minute default", async () => {
+    process.env.SANDBOX_AUTO_STOP_MIN = "10";
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo({ state: "paused" }));
+    const connect = spyOn(E2BSandbox, "connect").mockResolvedValue(fakeSandbox());
+    try {
+      await cubeSandboxProvider("cube-key", ready).get("cube-1");
+      expect(connect).toHaveBeenCalledWith("cube-1", expect.objectContaining({ timeoutMs: 10 * 60_000 }));
+    } finally {
+      getInfo.mockRestore();
+      connect.mockRestore();
+    }
+  });
+
+  test("pause stops an idle sandbox by id without connecting to it", async () => {
+    const pause = spyOn(E2BSandbox, "pause").mockResolvedValue(true);
+    const connect = spyOn(E2BSandbox, "connect").mockResolvedValue(fakeSandbox());
+    try {
+      await cubeSandboxProvider("cube-key", ready).pause?.("cube-1");
+      expect(pause).toHaveBeenCalledWith("cube-1", expect.objectContaining({ apiKey: "cube-key" }));
+      expect(connect).not.toHaveBeenCalled();
+    } finally {
+      pause.mockRestore();
+      connect.mockRestore();
+    }
+  });
+
+  test("allows public Cube traffic only behind an explicitly trusted ingress", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    process.env.CUBE_PROXY_TRUSTED_INGRESS = "true";
+    const sandbox = fakeSandbox();
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+
+    await cubeSandboxProvider("cube-key", ready).create({ snapshot: "agent-template" });
+
+    expect(create).toHaveBeenCalledWith(
+      "agent-template",
+      expect.objectContaining({ network: { allowPublicTraffic: true } }),
+    );
+
+    create.mockRestore();
+    getInfo.mockRestore();
+  });
+
+  test("adapts command results and preview credentials", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    let commandOptions: unknown;
+    const sandbox = fakeSandbox({
+      run: async (command, options) => {
+        commandOptions = options;
+        if (command.includes("getent hosts ")) {
+          return { exitCode: 0, stderr: "", stdout: "" };
+        }
+        return { exitCode: 7, stderr: "err", stdout: "out" };
+      },
+    });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const handle = await cubeSandboxProvider("", ready).create({ snapshot: "agent-template" });
+
+    expect(await handle.process.executeCommand("false", "/work", { A: "1" }, 12)).toEqual({
+      exitCode: 7,
+      result: "outerr",
+    });
+    expect(commandOptions).toEqual({ cwd: "/work", envs: { A: "1" }, timeoutMs: 12_000, user: "root" });
+    expect(await handle.getPreviewLink(4096)).toEqual({
+      token: "traffic-token",
+      headers: { "cube-traffic-access-token": "traffic-token", "e2b-traffic-access-token": "traffic-token" },
+      url: "https://4096-cube-1.sandbox.example.com",
+    });
+
+    create.mockRestore();
+    getInfo.mockRestore();
+  });
+
+  test("preserves non-zero command output when the SDK throws", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    const sandbox = fakeSandbox({
+      run: async (command) => {
+        if (command.includes("getent hosts ")) {
+          return { exitCode: 0, stderr: "", stdout: "" };
+        }
+        throw Object.assign(new Error("exit status 7"), {
+          exitCode: 7,
+          stderr: "diagnostic stderr",
+          stdout: "diagnostic stdout",
+        });
+      },
+    });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const handle = await cubeSandboxProvider("", ready).create({ snapshot: "agent-template" });
+
+    await expect(handle.process.executeCommand("false")).resolves.toEqual({
+      exitCode: 7,
+      result: "diagnostic stdoutdiagnostic stderr",
+    });
+
+    create.mockRestore();
+    getInfo.mockRestore();
+  });
+
+  test("sends terminal input through the Cube PTY API", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    const writes: Array<{ pid: number; text: string }> = [];
+    let ptyOptions: unknown;
+    const sandbox = fakeSandbox({
+      onPtyCreate: (options) => { ptyOptions = options; },
+      ptySendInput: async (pid, data) => {
+        writes.push({ pid, text: new TextDecoder().decode(data) });
+      },
+    });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const handle = await cubeSandboxProvider("", ready).create({ snapshot: "agent-template" });
+
+    const pty = await handle.process.createPty({
+      id: "terminal-1",
+      cols: 80,
+      rows: 24,
+      onData: () => {},
+    });
+    await pty.sendInput("printf 'CUBE_PTY_OK\\n'\n");
+
+    expect(ptyOptions).toEqual({
+      cols: 80,
+      rows: 24,
+      onData: expect.any(Function),
+      user: "root",
+      timeoutMs: 0,
+    });
+    expect(writes).toEqual([{ pid: 42, text: "printf 'CUBE_PTY_OK\\n'\n" }]);
+    expect(await pty.waitForTermination()).toEqual({ exitCode: 0 });
+
+    create.mockRestore();
+    getInfo.mockRestore();
+  });
+
+  test("settles Cube PTY termination for a non-zero process exit", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    const sandbox = fakeSandbox({
+      ptyWait: async () => {
+        throw { exitCode: 23, error: "provider detail", stdout: "", stderr: "failed" };
+      },
+    });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const handle = await cubeSandboxProvider("", ready).create({ snapshot: "agent-template" });
+    const pty = await handle.process.createPty({
+      id: "terminal-1",
+      cols: 80,
+      rows: 24,
+      onData: () => {},
+    });
+
+    expect(await pty.waitForTermination()).toEqual({ exitCode: 23 });
+
+    create.mockRestore();
+    getInfo.mockRestore();
+  });
+
+  test("rejects a non-standard public proxy port the E2B client cannot address", () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    process.env.CUBE_PROXY_PORT_HTTP = "8443";
+    expect(() => cubeSandboxProvider("", ready)).toThrow(
+      "Cube E2B adapter requires the public proxy on https port 443; got 8443",
+    );
+  });
+
+  test("does not return a fresh sandbox until its command channel and DNS are ready", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    process.env.CUBE_READINESS_RETRY_DELAY_MS = "1";
+    let probes = 0;
+    const sandbox = fakeSandbox({
+      run: async (command) => {
+        if (command.includes("getent hosts ")) {
+          probes += 1;
+          return {
+            exitCode: probes < 3 ? 2 : 0,
+            stderr: "",
+            stdout: "",
+          };
+        }
+        return { exitCode: 0, stderr: "", stdout: "" };
+      },
+    });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+
+    const handle = await cubeSandboxProvider("", ready).create({ snapshot: "agent-template" });
+
+    expect(handle.id).toBe("cube-1");
+    expect(probes).toBe(3);
+    create.mockRestore();
+    getInfo.mockRestore();
+  });
+
+  test("deletes a uid-1000 candidate before it can become ready", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    process.env.CUBE_READINESS_ATTEMPTS = "1";
+    const sandbox = fakeSandbox({
+      run: async (command) => ({
+        exitCode: command.includes('test "$(id -u)" = "0"') ? 10 : 0,
+        stderr: "",
+        stdout: command.includes('test "$(id -u)" = "0"') ? "STAGE=identity uid=1000" : "",
+      }),
+    });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const kill = spyOn(E2BSandbox, "kill").mockResolvedValue(true);
+
+    await expect(cubeSandboxProvider("", rootCheck).create({ snapshot: "agent-template" })).rejects.toThrow(
+      "failed readiness after 1 attempts at the runtime identity (uid, HOME) check: uid=1000",
+    );
+    expect(kill).toHaveBeenCalledWith("cube-1", expect.any(Object));
+
+    create.mockRestore();
+    getInfo.mockRestore();
+    kill.mockRestore();
+  });
+
+  test("preserves a retained sandbox when its runtime identity is incompatible", async () => {
+    const sandbox = fakeSandbox({
+      run: async (command) => ({
+        exitCode: command.includes('test "$(id -u)" = "0"') ? 1 : 0,
+        stderr: "",
+        stdout: "",
+      }),
+    });
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const connect = spyOn(E2BSandbox, "connect").mockResolvedValue(sandbox);
+    const kill = spyOn(E2BSandbox, "kill").mockResolvedValue(true);
+
+    await expect(cubeSandboxProvider("", rootCheck).get("cube-1")).rejects.toThrow(
+      "did not reach root identity/workspace",
+    );
+    expect(connect).toHaveBeenCalledWith("cube-1", expect.any(Object));
+    expect(kill).not.toHaveBeenCalled();
+
+    getInfo.mockRestore();
+    connect.mockRestore();
+    kill.mockRestore();
+  });
+
+  test("preserves a retained sandbox when its identity probe is transiently unavailable", async () => {
+    process.env.CUBE_IDENTITY_PROBE_ATTEMPTS = "2";
+    process.env.CUBE_IDENTITY_PROBE_DELAY_MS = "1";
+    let probes = 0;
+    const sandbox = fakeSandbox({
+      run: async () => {
+        probes += 1;
+        throw new Error("envd temporarily unavailable");
+      },
+    });
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const connect = spyOn(E2BSandbox, "connect").mockResolvedValue(sandbox);
+    const kill = spyOn(E2BSandbox, "kill").mockResolvedValue(true);
+
+    await expect(cubeSandboxProvider("", ready).get("cube-1")).rejects.toThrow(
+      "envd temporarily unavailable",
+    );
+    expect(probes).toBe(2);
+    expect(kill).not.toHaveBeenCalled();
+
+    getInfo.mockRestore();
+    connect.mockRestore();
+    kill.mockRestore();
+  });
+
+  test("tags background commands so named sessions survive adapter reconstruction", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    const calls: Array<{ command: string; options?: unknown }> = [];
+    const writes: Array<{ data: string; path: string }> = [];
+    const sandbox = fakeSandbox({
+      list: async () => [
+        {
+          envs: { USEAGENT_COMMAND_ID: "command-1", USEAGENT_SESSION_ID: "resident" },
+          pid: 71,
+        },
+      ],
+      run: async (command, options) => {
+        calls.push({ command, options });
+        return { exitCode: 0, stderr: "", stdout: "" };
+      },
+      write: async (path, data) => {
+        writes.push({ data, path });
+        return { path };
+      },
+    });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const handle = await cubeSandboxProvider("", ready).create({ snapshot: "agent-template" });
+
+    const result = await handle.process.executeSessionCommand("resident", {
+      command: "exec opencode serve",
+      runAsync: true,
+    });
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.data).toBe("exec opencode serve");
+    expect(calls.at(-1)?.command).toMatch(/^nohup setsid sh .* <\/dev\/null >.* 2>&1 &$/);
+    expect(calls.at(-1)?.options).toEqual({
+      user: "root",
+      envs: {
+        USEAGENT_COMMAND_ID: result.cmdId,
+        USEAGENT_SESSION_ID: "resident",
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(await handle.process.getSession("resident")).toEqual({
+      commands: [{ id: "command-1" }],
+    });
+
+    create.mockRestore();
+    getInfo.mockRestore();
+  });
+
+  test("gets and deletes sessions stamped with exact legacy process markers", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    const killed: number[] = [];
+    const commands: string[] = [];
+    const sandbox = fakeSandbox({
+      kill: async (pid) => {
+        killed.push(pid);
+        return true;
+      },
+      list: async () => [
+        {
+          envs: { SKYNET_COMMAND_ID: "legacy-command", SKYNET_SESSION_ID: "legacy-session" },
+          pid: 71,
+        },
+        {
+          envs: { SKYNET_COMMAND_ID: "other-command", SKYNET_SESSION_ID: "other-session" },
+          pid: 72,
+        },
+      ],
+      run: async (command) => {
+        commands.push(command);
+        return { exitCode: 0, stderr: "", stdout: "" };
+      },
+    });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const handle = await cubeSandboxProvider("", ready).create({ snapshot: "agent-template" });
+
+    expect(await handle.process.getSession("legacy-session")).toEqual({
+      commands: [{ id: "legacy-command" }],
+    });
+    await handle.process.deleteSession("legacy-session");
+
+    expect(killed).toEqual([71]);
+    expect(commands.at(-1)).toBe("rm -rf /tmp/skynet-cube-sessions/6c65676163792d73657373696f6e");
+
+    create.mockRestore();
+    getInfo.mockRestore();
+  });
+
+  test("reads per-node placement headroom from the local CubeOps inventory API", async () => {
+    process.env.CUBE_PROXY_SCHEME = "https";
+    process.env.CUBE_OPS_ACCESS_TOKEN = "ops-token";
+    process.env.CUBE_OPS_URL = "http://127.0.0.1:12088/opsapi/v1";
+    const list = spyOn(E2BSandbox, "list");
+    const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([{
+      nodeID: "node-a",
+      healthy: true,
+      schedulingDisabled: false,
+      allocatable: { cpuMilli: 3_000, memoryMB: 12_000 },
+    }]), { status: 200 }));
+
+    await expect(cubeSandboxProvider("", ready).inventory?.()).resolves.toMatchObject({
+      nodes: [{
+        id: "node-a",
+        ready: true,
+        schedulingDisabled: false,
+        allocatableCpuMillicores: 3_000,
+        allocatableMemoryMib: 12_000,
+      }],
+    });
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "http://127.0.0.1:12088/opsapi/v1/nodes",
+      expect.objectContaining({ headers: { Authorization: "Bearer ops-token" } }),
+    );
+    expect(list).not.toHaveBeenCalled();
+    list.mockRestore();
+    fetchSpy.mockRestore();
+  });
+
+  test("inventory without CubeOps returns nothing and lists nothing", async () => {
+    delete process.env.CUBE_OPS_ACCESS_TOKEN;
+    const list = spyOn(E2BSandbox, "list");
+    const fetchSpy = spyOn(globalThis, "fetch");
+    try {
+      await expect(cubeSandboxProvider("", ready).inventory?.()).resolves.toEqual({});
+      expect(list).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      list.mockRestore();
+      fetchSpy.mockRestore();
+    }
+  });
+});
+
+describe("Cube readiness reasons", () => {
+  test("the probe reports the stage that stopped it, in order", () => {
+    const command = cubeReadinessProbeCommand('test "$(id -u)" = "0"', "readiness.sandbox.example.com", "github.com");
+    expect(command).toContain("STAGE=identity");
+    expect(command.indexOf("STAGE=identity")).toBeLessThan(command.indexOf("STAGE=workspace"));
+    expect(command.indexOf("STAGE=workspace")).toBeLessThan(command.indexOf("STAGE=preview_dns"));
+    expect(command.indexOf("STAGE=preview_dns")).toBeLessThan(command.indexOf("STAGE=public_dns"));
+    expect(command.endsWith("printf READY")).toBe(true);
+  });
+
+  test("classifies a passing probe, each failing stage, and a transport error", () => {
+    expect(classifyCubeReadinessProbe({ exitCode: 0, result: "READY" })).toBeNull();
+    expect(classifyCubeReadinessProbe({ exitCode: 10, result: "STAGE=identity uid=1000 is not root" })).toEqual({
+      stage: "identity",
+      detail: "uid=1000 is not root",
+    });
+    expect(classifyCubeReadinessProbe({ exitCode: 12, result: "STAGE=preview_dns readiness.sandbox.example.com" })).toEqual({
+      stage: "preview_dns",
+      detail: "readiness.sandbox.example.com",
+    });
+    expect(classifyCubeReadinessProbe({ error: new Error("unable to get local issuer certificate") })).toEqual({
+      stage: "command",
+      detail: "unable to get local issuer certificate",
+    });
+    expect(classifyCubeReadinessProbe({ exitCode: 137, result: "" })).toEqual({ stage: "command", detail: "exit 137" });
+  });
+
+  test("the run error names the stage, the attempts and the private CA hint for transport failures", () => {
+    expect(describeCubeReadinessFailure("cube-1", 20, { stage: "command", detail: "unable to get local issuer certificate" })).toBe(
+      "Cube sandbox cube-1 failed readiness after 20 attempts at the command transport (envd over the data plane): " +
+        "unable to get local issuer certificate (a backend off the Cube host must trust the data plane's private CA via NODE_EXTRA_CA_CERTS)",
+    );
+    expect(describeCubeReadinessFailure("cube-1", 3, { stage: "public_dns", detail: "github.com" })).toBe(
+      "Cube sandbox cube-1 failed readiness after 3 attempts at the DNS lookup of the public host: github.com",
+    );
+  });
+
+  test("a create whose probe fails at DNS is deleted and reports that stage, not a generic line", async () => {
+    process.env.CUBE_API_URL = "http://127.0.0.1:3000";
+    process.env.CUBE_PROXY_SCHEME = "https";
+    process.env.CUBE_SANDBOX_DOMAIN = "sandbox.example.com";
+    process.env.CUBE_READINESS_ATTEMPTS = "2";
+    process.env.CUBE_READINESS_RETRY_DELAY_MS = "1";
+    const sandbox = fakeSandbox({
+      run: async (command: string) =>
+        command.includes("STAGE=identity")
+          ? { exitCode: 12, stderr: "", stdout: "STAGE=preview_dns readiness.sandbox.example.com" }
+          : { exitCode: 0, stderr: "", stdout: "" },
+    });
+    const create = spyOn(E2BSandbox, "create").mockResolvedValue(sandbox);
+    const getInfo = spyOn(E2BSandbox, "getInfo").mockResolvedValue(sandboxInfo());
+    const kill = spyOn(E2BSandbox, "kill").mockResolvedValue(true);
+    const error = await cubeSandboxProvider("cube-key", ready).create({ snapshot: "agent-template" }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      "Cube sandbox cube-1 failed readiness after 2 attempts at the DNS lookup of the preview host: readiness.sandbox.example.com",
+    );
+    expect(kill).toHaveBeenCalled();
+    create.mockRestore();
+    getInfo.mockRestore();
+    kill.mockRestore();
+  });
+});

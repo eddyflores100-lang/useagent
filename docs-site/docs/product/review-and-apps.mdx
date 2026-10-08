@@ -1,0 +1,57 @@
+---
+title: Apps, plugins, and review
+description: Connect services, inspect run-scoped capabilities, understand API-key limits, and review authorized GitHub repository work.
+sidebar:
+  order: 14
+---
+
+useAgent separates a connected account from an available run capability. The
+Apps and Settings surfaces manage connections. The Plugins surface summarizes
+what the live backend says is configured. The gateway still resolves and
+authorizes the exact tool operation for each run.
+
+## Connect an app
+
+1. Open **Apps** and search the marketplace.
+2. Select a service supported by the deployment.
+3. Complete its OAuth or credential flow.
+4. Return to Apps or Settings and confirm the connection status.
+
+The marketplace can display more providers than one deployment has configured.
+A catalog entry is not proof that an agent can call it. Connection status and
+the run's tool contract remain authoritative.
+
+## Inspect agent capabilities
+
+Open **Plugins** to see live backend state for GitHub, Slack, team memory, the
+selected sandbox runtime, knowledge/memory tools, Google sign-in, and stored
+credential names. Values are never shown.
+
+Before a run, `GET /api/capabilities` lists declared gateway tools and whether
+their family is configured. `currentRunAvailable` remains `null` because exact
+authorization depends on the active run and its resources.
+
+## Review
+
+A connected GitHub App supplies the repository and pull-request catalogs used
+by the task composer, bot repository picker, and `/review` workspace. Selected
+repositories become structured run resources and are cloned into the thread's
+sandbox after backend authorization.
+
+The review page lists open pull requests from the connected repository set. It
+does not grant write access by itself; mutations still travel through the
+approved GitHub gateway operation.
+
+## API keys are different
+
+Org API keys automate fleet dispatch and readback. They do not become app
+connections and cannot manage Settings, secrets, integrations, interactive
+terminal routes, or the browser-only thread-message convenience endpoint. See
+[CLI and MCP](/getting-started/cli) for the allowed workflow.
+
+## Expected outcome
+
+After a connection is healthy, the relevant resource appears in the composer
+or capability catalog. If a service is connected but unavailable to the current
+run, the product should explain the missing configuration, resource scope, or
+approval instead of showing an inert control.

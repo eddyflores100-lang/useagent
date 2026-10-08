@@ -1,0 +1,201 @@
+import { describe, expect, test } from "bun:test";
+
+import {
+  decodeApiRun,
+  decodeApiRunLifecycle,
+  decodeApiRunSummary,
+  decodeApiStep,
+  type ApiRun,
+  type ApiRunLifecycle,
+  type ApiRunSummary,
+  type ApiStep,
+  RUN_STATUSES,
+  STEP_KINDS,
+} from "../src/wire";
+
+const step = {
+  id: "step-1",
+  run_id: "run-1",
+  idx: 0,
+  kind: "command",
+  label: "Run",
+  chip: null,
+  code_json: null,
+  created_at: "2026-08-24T00:00:00.000Z",
+} satisfies ApiStep;
+
+const summary = {
+  id: "run-1",
+  prompt: "hello",
+  model: "openai/gpt-5.6-luna",
+  engine: "opencode",
+  status: "running",
+  summary: null,
+  duration_ms: null,
+  project_id: null,
+  repo: null,
+  repos: [],
+  repo_specs: [],
+  connector: null,
+  created_at: "2026-08-24T00:00:00.000Z",
+  updated_at: "2026-08-24T00:00:00.000Z",
+  latest_run_id: "run-2",
+  latest_status: "running",
+  latest_cancelled: false,
+  latest_created_at: "2026-08-24T00:01:00.000Z",
+  latest_updated_at: "2026-08-24T00:02:00.000Z",
+} satisfies ApiRunSummary;
+
+const run = {
+  id: summary.id,
+  prompt: summary.prompt,
+  model: summary.model,
+  engine: summary.engine,
+  status: summary.status,
+  summary: summary.summary,
+  duration_ms: summary.duration_ms,
+  project_id: summary.project_id,
+  repo: summary.repo,
+  repos: summary.repos,
+  repo_specs: summary.repo_specs,
+  connector: summary.connector,
+  created_at: summary.created_at,
+  updated_at: summary.updated_at,
+  org_id: "org-1",
+  user_id: "user-1",
+  parent_run_id: null,
+  child_session: false,
+  thread_id: "run-1",
+  engine_session_id: null,
+  sandbox_id: null,
+  resolved_resources: [],
+  memory_scope: "org",
+  skill_id: null,
+  skill_version: null,
+  skill_content_hash: null,
+  uploads: [],
+  steps: [step],
+} satisfies ApiRun;
+
+describe("run/step wire boundary decoders", () => {
+  test("exports the accepted enum values that derive the shared types", () => {
+    expect(RUN_STATUSES).toEqual(["queued", "running", "completed", "failed"]);
+    expect(STEP_KINDS).toEqual(["command", "file", "task", "done"]);
+  });
+
+  test("decodes valid full and compact run rows", () => {
+    expect(decodeApiRun(run)).toEqual(run);
+    expect(decodeApiRunSummary(summary)).toEqual(summary);
+    expect(decodeApiStep(step)).toEqual(step);
+  });
+
+  test("keeps a reported permission mode and rejects an unknown one", () => {
+    const guarded = { ...run, permission_mode: "read-only" as const };
+    expect(decodeApiRun(guarded)).toEqual(guarded);
+    expect(decodeApiRun({ ...run, permission_mode: "yolo" })).toBeNull();
+  });
+
+  test("keeps a reported run location, an explicit null included, and drops an unknown one", () => {
+    const local = { ...run, run_location: "local" as const };
+    expect(decodeApiRun(local)).toEqual(local);
+    const none = { ...run, run_location: null };
+    expect(decodeApiRun(none)).toEqual(none);
+    expect(decodeApiRun({ ...run, run_location: "laptop" })).toEqual(run);
+  });
+
+  test("keeps the run's thread sequence and rejects a non-numeric one", () => {
+    const sequenced = { ...run, thread_seq: 7 };
+    expect(decodeApiRun(sequenced)).toEqual(sequenced);
+    expect(decodeApiRun({ ...run, thread_seq: "7" })).toBeNull();
+  });
+
+  test("keeps the run's sandbox provider, null included, and drops a malformed one", () => {
+    const located = { ...run, sandbox_provider: "daytona" };
+    expect(decodeApiRun(located)).toEqual(located);
+    expect(decodeApiRun({ ...run, sandbox_provider: null })).toEqual({ ...run, sandbox_provider: null });
+    expect(decodeApiRun({ ...run, sandbox_provider: 7 })).toEqual(run);
+  });
+
+  test("decodes the exact durable lifecycle projection", () => {
+    const lifecycle = {
+      id: "run-1",
+      thread_id: "thread-1",
+      status: "failed",
+      cancelled: true,
+    } satisfies ApiRunLifecycle;
+    expect(decodeApiRunLifecycle(lifecycle)).toEqual(lifecycle);
+    expect(decodeApiRunLifecycle({ ...lifecycle, cancelled: undefined })).toBeNull();
+  });
+
+  test("decodes the connector a turn arrived through and never drops a row over it", () => {
+    const connector = {
+      source: "slack",
+      sender_name: "Sundar",
+      sender_avatar_url: "https://avatars.example/sundar-192.png",
+      permalink: "https://example.slack.com/archives/C1/p1700000000000100",
+    };
+    expect(decodeApiRun({ ...run, connector })?.connector).toEqual(connector);
+    expect(decodeApiRunSummary({ ...summary, connector })?.connector).toEqual(connector);
+    const { connector: _absent, ...older } = run;
+    expect(decodeApiRun(older)?.connector).toBeNull();
+    expect(decodeApiRun({ ...run, connector: { source: "" } })?.connector).toBeNull();
+    expect(decodeApiRun({ ...run, connector: { source: "slack", sender_name: 7 } })?.connector).toBeNull();
+    expect(decodeApiRun({ ...run, connector: "slack" })?.id).toBe(run.id);
+  });
+
+  test("synthesizes latest projection fields for legacy compact run rows", () => {
+    const {
+      latest_run_id: _latestRunId,
+      latest_status: _latestStatus,
+      latest_cancelled: _latestCancelled,
+      latest_created_at: _latestCreatedAt,
+      latest_updated_at: _latestUpdatedAt,
+      ...legacySummary
+    } = summary;
+
+    expect(decodeApiRunSummary(legacySummary)).toEqual({
+      ...legacySummary,
+      latest_run_id: legacySummary.id,
+      latest_status: legacySummary.status,
+      latest_created_at: legacySummary.created_at,
+      latest_updated_at: legacySummary.updated_at,
+    });
+  });
+
+  test("rejects partial latest projection fields", () => {
+    expect(decodeApiRunSummary({ ...summary, latest_updated_at: undefined })).toBeNull();
+    expect(decodeApiRunSummary({ ...summary, latest_cancelled: "no" })).toBeNull();
+  });
+
+  test("rejects unknown statuses and step kinds instead of typing them", () => {
+    expect(decodeApiRun({ ...run, status: "done" })).toBeNull();
+    expect(decodeApiRunSummary({ ...summary, status: "done" })).toBeNull();
+    expect(decodeApiRunSummary({ ...summary, latest_status: "done" })).toBeNull();
+    expect(decodeApiStep({ ...step, kind: "shell" })).toBeNull();
+  });
+
+  test("strictly decodes bounded native-child summary projections", () => {
+    const child = {
+      execution_id: "execution-1",
+      run_id: "run-1",
+      provider: "codex",
+      native_session_id: "session-1",
+      title: "Review checkout",
+      status: "running",
+      started_at: "2026-09-01T10:00:00.000Z",
+    };
+    expect(decodeApiRunSummary({
+      ...summary,
+      native_children: [child],
+      native_children_total: 3,
+    })?.native_children_total).toBe(3);
+    for (const total of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, 1.5]) {
+      expect(decodeApiRunSummary({
+        ...summary,
+        native_children: [child],
+        native_children_total: total,
+      })).toBeNull();
+    }
+    expect(decodeApiRunSummary({ ...summary, native_children_total: 1 })).toBeNull();
+  });
+});

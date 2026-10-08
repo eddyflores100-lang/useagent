@@ -1,0 +1,105 @@
+---
+title: Auth and organizations
+description: The tenant boundary. How sign-in works, how every resource is scoped to an organization, and how the dev-mode switches behave.
+sidebar:
+  order: 5
+---
+
+Every resource in UseAgent, a run, a secret, a skill, a piece of knowledge, an
+integration, belongs to exactly one organization. That boundary is enforced by the
+backend, not trusted from the client.
+
+## Sign-in
+
+`/login` and `/signup` go through the better-auth surface mounted at
+`/api/auth/*` (`GET` and `POST`), which owns sessions, email/password sign-in,
+and the organization plugin. Google social sign-in is env-gated: it is offered
+only when both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set.
+`GET /api/config` advertises which methods are enabled
+(`auth: { google, emailPassword }`), so the UI renders the right affordances
+without probing.
+
+Self-service account creation is closed by default. Signup is refused for both
+email/password and Google whenever verified dev mode is off, and the check
+always fails closed when `NODE_ENV=production`, even if a dev-mode flag was
+accidentally left on. Production users are administratively provisioned or
+invited.
+
+A deployment opens sign-up with `SIGNUP_OPEN=1`. Anyone can then create an
+account with an email address and a password; `SIGNUP_ALLOWED_DOMAINS` (a comma
+list) limits it to those domains, and `SIGNUP_INVITE_CODE` asks for a shared
+code on the sign-up card. An address a pending invitation names passes both:
+an invitation is an explicit admission, and the mailed confirmation still
+proves the mailbox. The switch needs the account mail transport
+(`CONNECTOR_EMAIL_HOST` and `CONNECTOR_EMAIL_FROM`, the settings invitations
+use): a new account is confirmed through a mailed link before its first
+sign-in, and without mail the switch stays inert with a warning at boot,
+because an invite code proves possession of the code, not of the address.
+
+An account that never confirmed its address, belongs to no organisation and
+never signed in is a claim on the address, not a person. The next accepted
+sign-up for that address replaces it and mails a fresh link; the newest link
+is the one that works, and an earlier one is refused. The mail says that the
+password was chosen by whoever filled in the form and carries a link that
+cancels the sign-up. A sign-up for an address that already has a confirmed
+account gets the same answer as a new one, without mail, so the sign-up answer
+itself reveals nothing; the card says so. A known limit: a sign-in with the
+password just chosen then tells the cases apart, since a claim answers that
+the address is unconfirmed while a confirmed account answers that the password
+is wrong. A Google identity that verifies the
+address takes over a claim on it: the claim's password is dropped and the
+identity links, invited or not. A sign-in with the right password for an
+unconfirmed address mails the link again, at most five times per address per
+hour, and the answer says when no mail was sent and why. Sign-up attempts are
+limited to ten per address and thirty per client per hour. All of these counts
+live in the backend's memory and start over when it restarts; the deployment
+runs one backend. Every account has a personal organization: a provisioned or
+invited one from creation, an open sign-up once its address is confirmed, a
+taken-over claim once the identity links, whether or not another organisation
+(a Slack workspace, say) admitted it first.
+
+## Organization scoping
+
+The organization is the tenant boundary, and scope is resolved server-side on
+every request; the backend never trusts an organization id supplied by the
+client. Resolution follows a fixed ladder:
+
+- A valid session resolves to its user plus the session's active organization,
+  falling back to the user's first membership.
+- An authenticated user with zero memberships gets `403 no_organization`. It
+  never silently borrows the dev org, because that would cross tenancy.
+- An anonymous request gets `401 unauthorized`, unless the dev-org fallback is
+  allowed (below), in which case it resolves to the seeded dev org.
+
+Every `/api/*` path runs behind a universal fail-closed adapter: a route is
+org-scoped unless its path is explicitly public or self-authenticating (health,
+config, the better-auth surface, the signature-verified Slack ingress, and the
+capability-authenticated internal bridges). A new router is therefore protected
+by default; forgetting a per-router guard does not leave it open.
+
+## Roles
+
+Membership role is a real authorization tier. Routes wrapped in the org-admin
+guard require the caller's membership role to be `owner` or `admin`; a plain
+member gets `403 organization_admin_required`. The gated surfaces are:
+
+- `PUT` and `DELETE /api/secrets/:name`, because secrets are executable sandbox
+  inputs and rotating credentials is an administration operation.
+- Accept and dismiss for learning-lane knowledge drafts and skill proposals,
+  because they change (or decline to change) what the whole organization learns.
+
+## Dev mode and the dev-org fallback
+
+A development mode exists to ease local work. The dev-org fallback, where an
+anonymous request resolves to the seeded dev org, defaults on in dev and off in
+production; `ALLOW_DEV_ORG` is the explicit switch in either direction. Set
+`ALLOW_DEV_ORG=0` to force real auth even in dev, or `ALLOW_DEV_ORG=1` to open
+the fallback deliberately in any environment. Self-signup is stricter: without
+`SIGNUP_OPEN` it is hard fail-closed in production regardless of any dev-mode flag.
+
+:::warning
+Org scoping is load-bearing for every other guarantee in the platform. Secrets,
+memory pools, knowledge, and runs are all partitioned by organization. The
+boundary is enforced at the backend and the database, so a bug in a single UI page
+cannot cross tenants.
+:::

@@ -1,0 +1,70 @@
+---
+title: Verification
+description: Prove deterministic contracts first, then certify the exact engine, credential, model, and sandbox combination you intend to claim.
+sidebar:
+  order: 4
+---
+
+Verification has two layers. Deterministic suites prove code contracts without
+spending provider resources. Live journeys prove one fully identified runtime
+combination. Passing the first layer does not imply the second.
+
+## Deterministic checks
+
+```bash
+bun run typecheck
+(cd backend && bun run test)
+(cd frontend && bun test components)
+```
+
+The backend suite uses an isolated test database. Shared package suites cover
+the provider-neutral client, harness, sandbox, artifact, CLI, and conformance
+contracts.
+
+For the documentation site:
+
+```bash
+(cd docs-site && bun install --frozen-lockfile)
+(cd docs-site && bun run doctor)
+(cd docs-site && bun run build)
+(cd docs-site && bunx blume validate)
+```
+
+## Live journey identity
+
+Record all of these fields with a live result:
+
+| Field | Why it matters |
+| --- | --- |
+| Commit and image digest | Prevents reusing evidence across changed code |
+| Engine and native driver | Distinguishes Codex, Claude Code, OpenCode, and Pi paths |
+| Sandbox provider and runtime generation | Prevents Box, Cube, and Daytona results from being conflated |
+| Auth mode and actor | Separates managed accounts, personal keys, and deployment keys |
+| Model | Captures model policy and paid-provider readiness |
+| Journey | Names what was actually tested: cold, resume, child isolation, replay, artifact, desktop, or another capability |
+
+## Minimum provider journey
+
+1. Start from a cold or explicitly retained sandbox state.
+2. Dispatch through the public `POST /api/runs` path.
+3. Observe the exact thread over `GET /api/runs/:id/thread-events`.
+4. Verify the native session identity and canonical completion.
+5. For resume, post a follow-up with `parent_run_id` in the same thread.
+6. For product child work, post the follow-up to the child root through the same
+   `/api/runs` route and verify sibling isolation.
+7. Clean up only the sandbox resources created for the test.
+
+Provider-native children need separate evidence. Their appearance in the event
+log does not prove that they accept follow-ups.
+
+## Interpret the result
+
+- A passing cold turn proves only cold execution for that fingerprint.
+- A passing reply proves retained-session resume for that thread.
+- A child transcript proves observation; messageability requires a verified
+  native resume/steer contract or a product child thread.
+- A rebuilt template is not active until the deployment selects it.
+- One provider's result says nothing about another provider's adapter.
+
+The current evidence ledger is summarized in
+[Verified support](/operations/verified-support).

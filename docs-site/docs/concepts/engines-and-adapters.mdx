@@ -1,0 +1,82 @@
+---
+title: Engines and native drivers
+description: How Codex, Claude Code, OpenCode, and Pi keep their native protocol while useAgent projects them into one product event contract.
+sidebar:
+  order: 4
+---
+
+An engine is the provider's agent loop. useAgent does not replace that loop or
+force every provider through one runtime protocol. It owns the durable thread,
+authorization, sandbox binding, event delivery, UI projection, and recovery
+around the engine.
+
+## Native harness invariant
+
+Codex, Claude Code, OpenCode, and Pi always use their provider-native driver,
+session identity, lifecycle, and event grammar. Choosing Box, Cube, or Daytona
+changes only the computer that hosts the runtime.
+
+The common UI protocol is useAgent's canonical event and client contract. It is
+**not ACP**, and there is no registered generic ACP execution engine.
+
+| Engine | Native execution path | Session shape |
+| --- | --- | --- |
+| Codex | Native Codex driver through the resident T3 orchestration runtime | A provider session with exact protocol, generation, and auth-epoch authority |
+| Claude Code | Native Claude Agent SDK driver through the resident T3 orchestration runtime | A provider session whose readiness is verified before each turn |
+| OpenCode | Native OpenCode driver through the resident T3 orchestration runtime | A retained native OpenCode session inside the thread sandbox |
+| Pi | Native Pi RPC bridge | A versioned RPC session with provider frames mapped into the canonical lane |
+
+## What the adapter boundary does
+
+The production registry in `backend/src/engines/index.ts` resolves a
+`ProviderDriver` before dispatch. Drivers declare lifecycle and model
+capabilities, start or resume the provider session, accept a turn, cancel when
+supported, and emit provider-native evidence.
+
+The canonical layer then projects supported messages, reasoning, tools,
+questions, approvals, tasks, and usage into the shared contract from
+`@useagent/agent-harness`. Raw provider events remain available as bounded
+diagnostic evidence. Unknown provider detail is not silently invented as a
+canonical event.
+
+## Engine readiness is credential-mode aware
+
+Codex, Claude Code, and OpenCode use their native drivers through the runtime
+adapter. Pi keeps its RPC driver. There is no alternate direct-server or generic
+ACP execution lane, and an unavailable native path is not silently replaced.
+
+Before dispatch, the backend checks all of these conditions:
+
+1. The engine is enabled on this deployment.
+2. Its authentication mode is configured.
+3. The selected model is allowed by engine policy.
+4. Any paid model provider has positive readiness evidence.
+5. The sandbox/provider combination can host the native runtime.
+
+A failure is returned as a typed unavailable or not-ready response. The backend
+does not switch engines, providers, or protocols behind the user's choice.
+
+## Codex managed-account path
+
+A connected ChatGPT/Codex account stays on the trusted backend. The backend
+hosts the Codex app-server and issues a one-use, run-bound relay capability to
+the sandbox runtime. OAuth state is never copied into the sandbox. Model choices
+come from a bounded native catalog for the current org and user, intersected
+with the deployment's Codex allowlist.
+
+## Provider-native children
+
+Some engines report their own child tasks or collaboration sessions. useAgent
+records and displays that provider evidence, including child identity and
+transcript status when available. A native child remains read-only unless the
+driver exposes a verified resume/steer contract for that exact session.
+
+That differs from a [product child thread](/concepts/runs-threads-commands#product-child-threads),
+which is an ordinary admitted useAgent thread and can receive follow-up turns.
+
+## Expected outcome
+
+Changing the sandbox provider does not change the selected engine's protocol.
+Changing engines starts a different root thread rather than rebinding an
+existing conversation. Within a thread, supported model changes are validated
+against the actor-scoped catalog before the turn is admitted.

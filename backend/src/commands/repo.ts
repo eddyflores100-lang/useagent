@@ -1,0 +1,217 @@
+import { and, eq, isNull, sql } from "drizzle-orm";
+import { DelegationStoppedError, hasRunCancelIntent } from "./cancel";
+import { db, type Executor } from "../db/client";
+import { bots, commands, runs, type CommandState } from "../db/schema";
+import { createRun, getLatestThreadRun } from "../runs/repo";
+import type { RunCommandInput } from "./types";
+import type { ExpectedSandboxBinding } from "../sandboxes/expected-binding";
+import { claimUploadsForRun, UploadClaimError } from "../uploads/repo";
+import { recordAdmissionOnAccept } from "../fleet/intake";
+import { ensureRootThreadRelationship, insertThreadRelationship } from "../runs/thread-relationship-repo";
+import { threadRelationshipsEnabled } from "../runs/thread-relationship-switch";
+import { enqueueProductChildStartedTx } from "../slack/product-child";
+
+// ---------------------------------------------------------------------------
+// Command persistence — pure data access, no decisions. The service layer
+// (service.ts) owns fingerprinting and conflict classification; this module
+// only reads and writes rows.
+// ---------------------------------------------------------------------------
+
+/** The command's product kind. `run.create` enqueues a turn; `run.cancel` is the
+ *  durable record of a user stop request (see commands/cancel.ts). */
+export const RUN_CREATE = "run.create" as const;
+export const RUN_CANCEL = "run.cancel" as const;
+
+export type CommandRecord = typeof commands.$inferSelect & {
+  readonly runOrigin: string | null;
+};
+
+/** Values needed to persist one accepted `run.create` command + its run. */
+export interface NewRunCommand {
+  readonly commandId: string;
+  readonly idempotencyKey: string | null;
+  readonly orgId: string;
+  readonly actorId: string | null;
+  readonly payloadFingerprint: string;
+  readonly payload: string;
+  readonly run: RunCommandInput["run"];
+  readonly expectedSandbox?: ExpectedSandboxBinding | null;
+  /** Exact server-owned internal origin (src/runs/origin.ts); null for a product
+   *  run. Persisted so downstream policy reads the accepted authority and never
+   *  derives trust from identifiers. */
+  readonly origin: string | null;
+  /** Server-owned fleet priority. Public run acceptance always supplies 0. */
+  readonly priority: number;
+  readonly threadRelationship?: RunCommandInput["threadRelationship"];
+  readonly botHome?: RunCommandInput["botHome"];
+  /** A turn handed to a bot inside an existing thread; carries the run that delegated it. */
+  readonly botHandoff?: RunCommandInput["botHandoff"];
+}
+
+/** Another first message opened the bot's home thread first; the losing
+ *  acceptance rolled back, so no stray root exists for it. */
+export class BotHomeThreadTakenError extends Error {
+  readonly code = "home_thread_already_created" as const;
+  constructor() {
+    super("bot home thread already created");
+  }
+}
+
+/** Look up a prior command by its per-tenant idempotency key. */
+export async function findCommandByKey(
+  orgId: string,
+  key: string,
+  exec: Executor = db,
+): Promise<CommandRecord | null> {
+  const [row] = await exec
+    .select({ command: commands, runOrigin: runs.origin })
+    .from(commands)
+    .innerJoin(runs, eq(commands.runId, runs.id))
+    .where(and(eq(commands.orgId, orgId), eq(commands.idempotencyKey, key)))
+    .limit(1);
+  return row ? { ...row.command, runOrigin: row.runOrigin } : null;
+}
+
+/**
+ * Persist the command + its run in ONE transaction. North star "Transaction
+ * Boundaries": command acceptance and canonical state mutation commit together,
+ * and nothing is published before they commit (the worker is spawned by the
+ * caller only after this resolves). The run is inserted first so the command's
+ * `run_id` FK is satisfiable in-transaction. Throws on a unique-key violation —
+ * the caller decides what a conflict means.
+ */
+export async function insertCommandWithRun(
+  cmd: NewRunCommand,
+  exec: Executor = db,
+): Promise<void> {
+  const insert = async (tx: Executor): Promise<void> => {
+    // A reply that carries no choice keeps the thread's current mode, read here
+    // under the thread lifecycle lock this acceptance holds, so a narrowing reply
+    // that committed meanwhile is never undone by an earlier, stale read. The
+    // same read copies the thread's run location onto the reply: the root's
+    // choice rides every turn, so a turn whose retained sandbox is gone still
+    // asks for the place the thread was started on.
+    const latest = cmd.run.parentRunId && (cmd.run.permissionMode === undefined || cmd.run.runLocation === undefined)
+      ? await getLatestThreadRun(cmd.orgId, cmd.run.threadId, tx) : null;
+    const permissionMode = cmd.run.permissionMode ?? latest?.permissionMode;
+    const runLocation = cmd.run.runLocation === undefined ? latest?.runLocation ?? null : cmd.run.runLocation;
+    await createRun(
+      {
+        id: cmd.run.id,
+        prompt: cmd.run.prompt,
+        model: cmd.run.model,
+        reasoningEffort: cmd.run.reasoningEffort ?? null,
+        engine: cmd.run.engine,
+        orgId: cmd.orgId,
+        userId: cmd.actorId,
+        parentRunId: cmd.run.parentRunId,
+        threadId: cmd.run.threadId,
+        repos: cmd.run.repos,
+        resolvedResources: cmd.run.resolvedResources,
+        memoryScope: cmd.run.memoryScope,
+        permissionMode,
+        runLocation,
+        skillId: cmd.run.skillId,
+        skillVersion: cmd.run.skillVersion,
+        skillContentHash: cmd.run.skillContentHash,
+        commandName: cmd.run.commandName,
+        commandProvider: cmd.run.commandProvider,
+        commandSessionId: cmd.run.commandSessionId,
+        commandCatalogRevision: cmd.run.commandCatalogRevision,
+        expectedSandbox: cmd.expectedSandbox ?? null,
+        origin: cmd.origin,
+      },
+      tx,
+    );
+    if (cmd.botHome) {
+      const stamped = await tx
+        .update(bots)
+        .set({ homeThreadId: cmd.run.id, updatedAt: new Date() })
+        .where(and(eq(bots.orgId, cmd.orgId), eq(bots.id, cmd.botHome.botId), isNull(bots.homeThreadId)))
+        .returning({ id: bots.id });
+      if (stamped.length === 0) throw new BotHomeThreadTakenError();
+    }
+    // Delegation (a delegated thread, or a turn handed to a bot in an existing
+    // thread) is recorded under the delegating thread's lock, the same one a
+    // Stop takes: a turn that was stopped cannot delegate afterwards. Explicit
+    // continuation by a person is not delegation and is not refused.
+    const delegation = cmd.threadRelationship?.kind === "delegated" && cmd.threadRelationship.parentThreadId
+      ? { parentThreadId: cmd.threadRelationship.parentThreadId, sourceRunId: cmd.threadRelationship.sourceRunId }
+      : cmd.botHandoff
+        ? { parentThreadId: cmd.botHandoff.parentThreadId, sourceRunId: cmd.botHandoff.sourceRunId }
+        : null;
+    if (delegation) {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${cmd.orgId}), hashtext(${delegation.parentThreadId}))`);
+      if (await hasRunCancelIntent(cmd.orgId, delegation.sourceRunId, tx)) throw new DelegationStoppedError();
+    }
+    if (cmd.threadRelationship) {
+      await insertThreadRelationship({
+        orgId: cmd.orgId,
+        threadId: cmd.run.threadId,
+        ...cmd.threadRelationship,
+      }, tx);
+      if (cmd.threadRelationship.parentThreadId) {
+        await enqueueProductChildStartedTx({
+          exec: tx,
+          orgId: cmd.orgId,
+          threadId: cmd.run.threadId,
+          runId: cmd.run.id,
+          title: cmd.threadRelationship.title,
+        });
+      }
+    } else if (
+      cmd.origin === null &&
+      cmd.run.parentRunId === null &&
+      cmd.run.threadId === cmd.run.id &&
+      threadRelationshipsEnabled()
+    ) {
+      await ensureRootThreadRelationship({
+        orgId: cmd.orgId,
+        threadId: cmd.run.threadId,
+        title: cmd.run.prompt.slice(0, 160) || "Untitled thread",
+      }, tx);
+    }
+    const attachmentIds = cmd.run.attachmentIds ?? [];
+    if (attachmentIds.length > 0) {
+      if (!cmd.actorId) throw new UploadClaimError();
+      await claimUploadsForRun(
+        {
+          ids: attachmentIds,
+          orgId: cmd.orgId,
+          userId: cmd.actorId,
+          runId: cmd.run.id,
+        },
+        tx,
+      );
+    }
+    await tx.insert(commands).values({
+      id: cmd.commandId,
+      idempotencyKey: cmd.idempotencyKey,
+      orgId: cmd.orgId,
+      actorId: cmd.actorId,
+      kind: RUN_CREATE,
+      runId: cmd.run.id,
+      threadId: cmd.run.threadId,
+      payloadFingerprint: cmd.payloadFingerprint,
+      payload: cmd.payload,
+      state: "queued" satisfies CommandState,
+      attemptCount: 0,
+    });
+    // Durable fleet admission: enforce the per-org queue ceiling (429) and record
+    // the workload's resource class ATOMICALLY with the run + command, so a queued
+    // task is exactly as crash-durable as the run itself.
+    await recordAdmissionOnAccept(
+      {
+        runId: cmd.run.id,
+        orgId: cmd.orgId,
+        threadId: cmd.run.threadId,
+        engine: cmd.run.engine,
+        model: cmd.run.model,
+        priority: cmd.priority,
+      },
+      tx,
+    );
+  };
+  if (exec === db) await db.transaction(insert);
+  else await insert(exec);
+}

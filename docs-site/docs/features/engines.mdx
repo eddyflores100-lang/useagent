@@ -1,0 +1,60 @@
+---
+title: Native engines
+description: Four provider-native agent runtimes behind one durable product contract, with explicit readiness and no protocol substitution.
+sidebar:
+  order: 5
+---
+
+useAgent supports Codex, Claude Code, OpenCode, and Pi without rebuilding their
+agent loops. Each keeps its native protocol and session lifecycle. The platform
+adds durable threads, connected resources, guarded tools, sandbox placement,
+artifacts, and one UI projection around them.
+
+## Four engines, one product grammar
+
+| Engine | Driver | Best source of current availability |
+| --- | --- | --- |
+| Codex | Native Codex through T3 | Actor-scoped native catalog plus Codex policy |
+| Claude Code | Native Claude Agent SDK through T3 | Engine and Anthropic readiness |
+| OpenCode | Native OpenCode driver through T3 | Engine and selected model-provider readiness |
+| Pi | Native Pi RPC | Engine and selected model-provider readiness |
+
+The timeline consumes canonical useAgent events from
+`@useagent/agent-harness`. That common UI grammar is not ACP, and there is no
+registered generic ACP execution lane.
+
+## Capability-aware controls
+
+The pre-run catalog reports what is configured. The active provider session
+reports what this exact run can do. Model switching, questions, approvals,
+reasoning, plans, native commands, children, cancellation, and resume controls
+appear only when the relevant contract supports them.
+
+If the connection, model, runtime, or sandbox combination is unavailable, the
+product shows the reason and stops. It does not swap the engine, downgrade the
+lifecycle, or route a native engine through ACP.
+
+## Session continuity
+
+A provider session is persisted with its provider, protocol identity, runtime
+generation, and auth epoch. A reply can resume only when that complete authority
+still matches the current driver and credential state. A bare task id or stale
+native session id is insufficient.
+
+The thread also retains its sandbox and repository workspace. Runtime upgrades
+must preserve that workspace or fail closed; a generation mismatch is not
+permission to delete and recreate it.
+
+## Managed Codex account
+
+The native Codex app-server and OAuth credential stay on the backend. A
+one-use, run-bound relay lets the sandbox runtime execute the turn without
+receiving reusable OAuth state. Native model discovery is cached per actor and
+auth epoch, then filtered by policy before the model picker can dispatch it.
+
+## Verify the exact combination
+
+Implementation does not equal certification. Read
+[Verified support](/operations/verified-support) before making an
+engine/provider claim, and use `GET /api/capabilities` for the signed-in actor's
+current runtime truth.

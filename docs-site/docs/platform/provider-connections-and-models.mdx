@@ -1,0 +1,83 @@
+---
+title: Provider connections and models
+description: Connect model and computer providers, understand actor-scoped catalogs, and see why a configured model may still be unavailable.
+sidebar:
+  order: 2
+---
+
+useAgent resolves credentials on the trusted backend at turn time. The browser
+can write a reusable credential and later read its metadata, but it cannot read
+the secret back. The sandbox receives only the run-bound configuration or
+gateway capability needed for that turn.
+
+## Connection types
+
+| Kind | Providers | What it controls |
+| --- | --- | --- |
+| Managed account | Codex through ChatGPT/Codex OAuth | The signed-in actor's native Codex session and native model catalog |
+| Model API key | OpenAI, Anthropic, OpenRouter, Cerebras | Which paid model routes the actor can use through the provider gateway |
+| Computer API key | Box, Daytona | Where that actor's thread sandboxes run when personal computers are enabled |
+
+Cube is a deployment-selected sandbox plugin rather than a personal connection
+in the current provider-connection API.
+
+Connections belong to the signed-in user inside the active organization. Every
+provider-connection route requires a real user; the local dev-org fallback is
+not enough.
+
+## Connect an API key
+
+1. Open **Settings → Connections**.
+2. Choose the model or computer provider.
+3. Paste the key and any required computer metadata, such as a snapshot name.
+4. Save, then wait for the status to report **Connected**.
+
+The write uses `PUT /api/provider-connections/:provider/api-key`. Reads from
+`GET /api/provider-connections` return status, dates, and safe metadata only.
+Revoke with `POST /api/provider-connections/:provider/revoke`.
+
+Expected outcome: the connection-change stream refreshes Settings and the
+capability catalog. A stored computer key changes run placement only when the
+deployment enables personal computers.
+
+## Connect Codex
+
+The Codex device flow is managed by the backend. OAuth state and the native
+Codex app-server stay outside the sandbox. After connection, the backend loads a
+bounded native model catalog for the exact org/user actor and intersects it with
+the deployment allowlist.
+
+## Actor-scoped model catalog
+
+`GET /api/capabilities` is the picker contract. For each engine it reports:
+
+- whether the engine is configured and ready;
+- the native runtime kind currently selected;
+- allowed model ids and the engine default;
+- whether each model is policy-allowed and dispatchable;
+- native Codex display names and reasoning efforts when available;
+- a stale or unavailable catalog reason.
+
+The catalog is actor-scoped because connected credentials are actor-scoped. A
+model visible to one member is not evidence that another member can dispatch it.
+
+## Astra policy
+
+`gpt-6-astra` is in the current Codex policy allowlist. It becomes dispatchable
+only when the signed-in actor's native Codex catalog also exposes it and the
+Codex connection is healthy. The UI must keep a native-but-disallowed model
+visible as unavailable rather than implying it can run.
+
+## Why “configured” is not “ready”
+
+An engine may be enabled while its credential is missing, a paid provider is
+unhealthy, or its model fails policy. The backend checks engine readiness and
+the selected model's provider again when admitting a run. A failed check returns
+a typed reason such as `model_not_allowed`, `model_provider_not_ready`, or
+`provider_unhealthy`; it never silently chooses a cheaper or different model.
+
+:::warning
+Provider connection metadata is safe to display. Reusable API keys and OAuth
+tokens are write-only and encrypted at rest. They are not returned to the
+browser, copied into the event log, or exposed as a general sandbox secret.
+:::

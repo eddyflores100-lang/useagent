@@ -1,0 +1,137 @@
+/**
+ * Test preload — runs before any test file (and, crucially, before any app
+ * module is imported), so it wins over Bun's auto-loaded `.env`.
+ *
+ *  - Points every DB client (Drizzle in src/db, the knowledge store, better-auth,
+ *    drizzle-kit) at the isolated `useagent_test` database.
+ *  - Strips OPENROUTER_API_KEY / OPENAI_API_KEY so distillation degrades to its
+ *    keyless STUB path and embeddings degrade to keyword-only — zero LLM calls,
+ *    fully deterministic. (The app reads these keys lazily, so deleting them here
+ *    is sufficient.)
+ *  - Collapses the scripted worker delay so a run completes in well under a
+ *    second instead of ~12s.
+ *  - Enables the env-gated Slack adapter with fixed test secrets (the mount is
+ *    decided at src/index import time, so this must be set BEFORE any app
+ *    import) and pins its runs to the fast `mock` engine. Outbound Slack calls
+ *    are intercepted via setSlackClientForTest — nothing hits the network.
+ */
+import { testDatabaseUrl } from "./test-database";
+
+process.env.DATABASE_URL = testDatabaseUrl();
+process.env.PORT = "3211";
+// The in-process client sends this origin; the library skips its own origin check
+// under NODE_ENV=test, our own guards do not.
+process.env.BETTER_AUTH_TRUSTED_ORIGINS ??= "http://localhost:3200";
+
+delete process.env.OPENROUTER_API_KEY;
+delete process.env.OPENAI_API_KEY;
+delete process.env.WIKI_GEN_STRUCTURE_RETRIES;
+
+// Strip GitHub creds so the unit suite is hermetic — no live GitHub calls (repo
+// listing / installation-token mint) leak in from backend/.env. Standalone live
+// verification scripts have no [test] preload and manage their own credentials.
+for (const k of [
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "GITHUB_PAT",
+  "GITHUB_ORG",
+  "GITHUB_OWNER",
+  "GITHUB_APP_ID",
+  "GITHUB_APP_PRIVATE_KEY",
+]) {
+  delete process.env[k];
+}
+
+// Never let a dev .env's periodic skill resync / code indexer start its boot
+// sweep inside the unit suite (the app import runs startSkillsResync +
+// startCodeIndex).
+delete process.env.SKILLS_RESYNC_INTERVAL_MIN;
+delete process.env.CODE_INDEX_INTERVAL_MIN;
+
+process.env.WORKER_STEP_DELAY_MS = process.env.WORKER_STEP_DELAY_MS ?? "5";
+
+// The Free-model qualifier reads OpenRouter's public catalog and starts probe
+// runs on its tick. The unit suite never leaves the process, so its kill
+// switch is set; the lane serves the generation the test database migrated in.
+process.env.FREE_MODEL_QUALIFIER = "off";
+// Same for the gateway's read of the primary's product flags: a fixture origin
+// such as 127.0.0.1:3201 may be a live server on a developer machine.
+const { setPrimaryProductFlagsFetcherForTest } = await import(
+  "../src/knowledge/gateway/product-flags"
+);
+setPrimaryProductFlagsFetcherForTest(async () => new Response(null, { status: 503 }));
+
+// Fleet capacity defaults are conservative for the single prod host; the general
+// unit suite predates capacity gating and submits freely, so open the limits wide
+// here (a deploy keeps the real defaults). The dedicated fleet tests set small
+// limits at runtime to exercise queueing deterministically.
+process.env.FLEET_GLOBAL_MAX_ACTIVE_SANDBOXES =
+  process.env.FLEET_GLOBAL_MAX_ACTIVE_SANDBOXES ?? "100000";
+process.env.FLEET_ORG_MAX_ACTIVE_SANDBOXES =
+  process.env.FLEET_ORG_MAX_ACTIVE_SANDBOXES ?? "100000";
+process.env.FLEET_ORG_MAX_QUEUE_DEPTH =
+  process.env.FLEET_ORG_MAX_QUEUE_DEPTH ?? "1000000";
+// The host budget defaults to the single prod host (12 000 millicores, 62 GiB).
+// Suites that simulate crashed workers leave sandbox leases in 'active' at
+// 2 000 millicores each, and nothing collects them here (the reconciler is off),
+// so six of them fill that budget and every later run queues on capacity until
+// a fleet suite truncates the leases. Open it like the limits above; the fleet
+// suites narrow it per test.
+process.env.FLEET_HOST_CPU_MILLICORES = process.env.FLEET_HOST_CPU_MILLICORES ?? "100000000";
+process.env.FLEET_HOST_MEMORY_MIB = process.env.FLEET_HOST_MEMORY_MIB ?? "100000000";
+// Fast reconciler tick when a test starts the loop explicitly.
+process.env.FLEET_TICK_MS = process.env.FLEET_TICK_MS ?? "200";
+// The general suite drives admission explicitly (no background loop pumping
+// queued work behind tests' backs); the dedicated fleet tests start it themselves.
+process.env.FLEET_RECONCILER_AUTOSTART = process.env.FLEET_RECONCILER_AUTOSTART ?? "0";
+
+// Unit fixtures intentionally exercise every provider lane without making paid
+// calls. Mark those synthetic lanes as proven so the same centralized
+// acceptance gate used in production remains active during tests.
+process.env.ENABLED_ENGINES = "opencode,claude,codex";
+for (const engine of ["OPENCODE", "CLAUDE", "CODEX"] as const) {
+  process.env[`ENGINE_READINESS_${engine}`] = "verified";
+}
+for (const provider of ["ANTHROPIC", "OPENAI", "OPENROUTER"] as const) {
+  process.env[`PROVIDER_HEALTH_${provider}`] = "verified";
+}
+// Sandbox engines are ready only with a wired provider gateway. The unit suite
+// never spawns a sandbox, so a loopback origin and a fixture secret stand in
+// for the deployment's real wiring (tests that exercise the gateway itself set
+// their own values).
+process.env.GATEWAY_PUBLIC_URL = process.env.GATEWAY_PUBLIC_URL ?? "http://127.0.0.1:3299";
+process.env.PROVIDER_GATEWAY_SECRET =
+  process.env.PROVIDER_GATEWAY_SECRET ?? "unit-suite-provider-gateway-secret-0123456789";
+// A wired GATEWAY_PUBLIC_URL makes the tool gateway config demand its own
+// secret as well (a deployment always carries both).
+process.env.TOOL_GATEWAY_SECRET =
+  process.env.TOOL_GATEWAY_SECRET ?? "unit-suite-tool-gateway-secret-9876543210abcdef";
+
+process.env.SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? "xoxb-test-token";
+process.env.SLACK_LEGACY_TEAM_ID = process.env.SLACK_LEGACY_TEAM_ID ?? "T0TESTTEAM";
+process.env.SLACK_SIGNING_SECRET =
+  process.env.SLACK_SIGNING_SECRET ?? "test-signing-secret";
+delete process.env.SLACK_APP_ID;
+delete process.env.SLACK_CLIENT_ID;
+delete process.env.SLACK_CLIENT_SECRET;
+delete process.env.SLACK_OAUTH_REDIRECT_URI;
+process.env.SLACK_DEFAULT_ENGINE = process.env.SLACK_DEFAULT_ENGINE ?? "mock";
+// Slack outbox: kicks still deliver promptly, but push the background relay tick
+// far out so it never races a test's explicit processDue(); tiny backoff base so
+// any live-timed retry is fast.
+process.env.SLACK_OUTBOX_TICK_MS = process.env.SLACK_OUTBOX_TICK_MS ?? "3600000";
+// Memory tests drain explicitly. A background delivery would race their
+// process-global fetch fixtures and attribute another run's writes to this test.
+process.env.MEMORY_OUTBOX_TICK_MS = process.env.MEMORY_OUTBOX_TICK_MS ?? "3600000";
+process.env.SLACK_OUTBOX_BASE_MS = process.env.SLACK_OUTBOX_BASE_MS ?? "20";
+
+// Build the schema once per process, before the first test file. helpers.ts
+// (via src/index) runs the same migrator at boot, but a database-backed file
+// that never imports it (a repo test with its own fixtures) otherwise depends
+// on running AFTER one that does: alone, or first in CI's file order, it dies
+// with `relation "runs" does not exist`. The migrator skips applied entries,
+// so the boot call that follows is a cheap no-op and the suite pays for the
+// schema exactly once, as before.
+const { migrate } = await import("drizzle-orm/postgres-js/migrator");
+const { db } = await import("../src/db/client");
+await migrate(db, { migrationsFolder: `${import.meta.dir}/../drizzle` });

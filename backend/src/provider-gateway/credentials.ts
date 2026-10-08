@@ -1,0 +1,142 @@
+import { providerOfferedToUser } from "./provider-accounts";
+import { decryptOrgSecretByName } from "../secrets/store";
+import { runtimeDevModeEnabled } from "../security/runtime-secrets";
+import { resolveGatewayProviderApiKeyCredential } from "./api-key-credentials";
+import { providerCredentialName, type ProviderId } from "./provider";
+
+/**
+ * Which identity's key served a provider request. This is a non-secret LABEL
+ * only - never key material - so it is safe to log and to attribute usage by.
+ */
+export type ProviderCredentialSource =
+  | "user_connection" // a customer's connected BYO API key (provider_connections)
+  | "org_secret" // an org-level provider secret (org secrets store)
+  | "backend_env"; // the shared house/operator key from process.env
+
+export interface ResolvedProviderCredential {
+  readonly value: string;
+  readonly source: ProviderCredentialSource;
+}
+
+/**
+ * Injectable seams so the resolution precedence can be unit-tested without a
+ * database. Production callers pass nothing and get the real DB/env resolvers.
+ */
+export interface ProviderCredentialResolvers {
+  readonly resolveUserConnection?: typeof resolveGatewayProviderApiKeyCredential;
+  readonly resolveOrgSecret?: (orgId: string, name: string) => Promise<string | null>;
+  readonly env?: Record<string, string | undefined>;
+  readonly devModeEnabled?: (env?: Record<string, string | undefined>) => boolean;
+  /** Test seam for the PROVIDER_ACCOUNTS account read (default: the user table). */
+  readonly userEmail?: (userId: string) => Promise<string | null>;
+}
+
+/** How long a run waits for its credential reads before failing the turn. */
+export const PROVIDER_CREDENTIAL_WAIT_MS = 10_000;
+
+/** The run's own clock for credential reads. Callers wrap the whole resolution
+ *  in awaitWithSignal with this signal: Stop aborts it, and a blocked read (a
+ *  lock on the secrets or connections tables) cannot hold the run past the
+ *  deadline. */
+export function credentialWaitSignal(signal?: AbortSignal): AbortSignal {
+  const deadline = AbortSignal.timeout(PROVIDER_CREDENTIAL_WAIT_MS);
+  return signal ? AbortSignal.any([signal, deadline]) : deadline;
+}
+
+async function defaultOrgSecret(orgId: string, name: string): Promise<string | null> {
+  return (await decryptOrgSecretByName(orgId, name))?.value ?? null;
+}
+
+/**
+ * Resolve one provider credential in the trusted backend, tenant first. Returns
+ * the winning key AND its non-secret provenance so the caller can record which
+ * identity served the request. Shared operator (env) credentials are a
+ * local-development convenience only: a production org without its own provider
+ * secret fails closed rather than spend another tenant's/shared account.
+ */
+export async function resolveProviderCredential(
+  orgId: string,
+  provider: ProviderId,
+  deps: ProviderCredentialResolvers = {},
+): Promise<ResolvedProviderCredential | null> {
+  const resolveOrgSecret = deps.resolveOrgSecret ?? defaultOrgSecret;
+  const env = deps.env ?? process.env;
+  const devModeEnabled = deps.devModeEnabled ?? runtimeDevModeEnabled;
+  const name = providerCredentialName(provider);
+  const tenantValue = (await resolveOrgSecret(orgId, name))?.trim();
+  if (tenantValue) return { value: tenantValue, source: "org_secret" };
+  if (!devModeEnabled(env)) return null;
+  const houseKey = env[name]?.trim();
+  return houseKey ? { value: houseKey, source: "backend_env" } : null;
+}
+
+/**
+ * Resolve one provider credential for a concrete run. THIS is the single
+ * resolution point for sandboxed engine runs; no other place picks a run's
+ * provider key. Precedence: a customer's connected BYO API key wins over the
+ * tenant/org secret, which wins over the shared house key - so a connected
+ * account spends its own provider quota without ever exposing that key to the
+ * sandbox. A resolved key is used as-is: an invalid customer key surfaces the
+ * provider's real error to the run (proxied back by the gateway) instead of
+ * silently re-billing the house. ChatGPT OAuth bundles are intentionally not
+ * returned here: the provider gateway talks to public API endpoints, while
+ * subscription-backed Codex auth must go through a trusted Codex broker path.
+ */
+export async function resolveProviderCredentialForRun(
+  input: {
+    orgId: string;
+    userId?: string | null;
+    provider: ProviderId;
+    model?: string | null;
+  },
+  deps: ProviderCredentialResolvers = {},
+): Promise<ResolvedProviderCredential | null> {
+  const resolveUserConnection = deps.resolveUserConnection ?? resolveGatewayProviderApiKeyCredential;
+  // A provider PROVIDER_ACCOUNTS withholds from this run's user has no key for
+  // it, whoever connected one: the gate and the gateway both resolve here.
+  if (!(await providerOfferedToUser(input.provider, input.userId, deps.env ?? process.env, deps.userEmail))) return null;
+  // A Free-lane model on OpenCode Zen runs on the deployment's Zen account
+  // only: its free marker is ours, so a model Zen reprices must meet the house
+  // account's empty balance, never a tenant's funded key.
+  if (input.provider === "opencode" && input.model?.endsWith(":free")) {
+    const houseKey = (deps.env ?? process.env).OPENCODE_API_KEY?.trim();
+    return houseKey ? { value: houseKey, source: "backend_env" } : null;
+  }
+  if (input.userId) {
+    const userCredential = await resolveUserConnection({
+      orgId: input.orgId,
+      userId: input.userId,
+      provider: input.provider,
+    });
+    if (userCredential) return { value: userCredential, source: "user_connection" };
+  }
+  // Free models are free on the member's own OpenRouter key, so they follow
+  // the same order as paid ones: the member's connection, then the
+  // organisation's secret, and in production nothing else. The deployment's
+  // own keys never serve a member's run.
+  return resolveProviderCredential(input.orgId, input.provider, deps);
+}
+
+/**
+ * Resolve the OpenRouter credential for the Chat surface and the `chat` engine.
+ * Same order as a run: the member's connected key, then the organisation's
+ * stored secret, and in production nothing else. The deployment's own key never
+ * serves a member's turn. Once a key is chosen it is the only key used: an
+ * invalid member key surfaces the real OpenRouter error instead of quietly
+ * billing another account.
+ */
+export async function resolveChatProviderCredential(
+  input: { orgId: string; userId?: string | null },
+  deps: ProviderCredentialResolvers = {},
+): Promise<ResolvedProviderCredential | null> {
+  const resolveUserConnection = deps.resolveUserConnection ?? resolveGatewayProviderApiKeyCredential;
+  if (input.userId) {
+    const userCredential = await resolveUserConnection({
+      orgId: input.orgId,
+      userId: input.userId,
+      provider: "openrouter",
+    });
+    if (userCredential) return { value: userCredential, source: "user_connection" };
+  }
+  return resolveProviderCredential(input.orgId, "openrouter", deps);
+}

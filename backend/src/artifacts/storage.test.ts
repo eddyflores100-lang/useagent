@@ -1,0 +1,282 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { assertArtifactStorageWritable, LocalArtifactStorage } from "./storage";
+
+const roots = new Set<string>();
+
+afterEach(async () => {
+  await Promise.all([...roots].map((root) => rm(root, { recursive: true, force: true })));
+  roots.clear();
+});
+
+describe("assertArtifactStorageWritable", () => {
+  test.skipIf(process.platform === "win32")("rejects a store that cannot accept non-empty files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "useagent-artifacts-limit-"));
+    roots.add(root);
+    const script = `
+      process.on("SIGXFSZ", () => {});
+      const { assertArtifactStorageWritable } = await import(${JSON.stringify(new URL("./storage.ts", import.meta.url).href)});
+      try {
+        await assertArtifactStorageWritable(${JSON.stringify(root)});
+        console.log(JSON.stringify({ ok: true }));
+      } catch (error) {
+        console.log(JSON.stringify({ ok: false, error: error.message }));
+      }
+    `;
+    // Empty files still work with a zero file-size limit; real artifact bytes do not.
+    const child = Bun.spawn([
+      "/bin/sh", "-c", 'ulimit -f 0; exec "$@"', "probe", process.execPath, "-e", script,
+    ], {
+      env: { ...process.env, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = await new Response(child.stdout).text();
+    expect(await child.exited).toBe(0);
+    const result = JSON.parse(output) as { ok: boolean; error?: string };
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("artifact storage is not writable");
+    expect(await readdir(root)).toEqual([]);
+  });
+
+  test("creates a missing root and leaves no probe behind", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "useagent-artifacts-boot-"));
+    roots.add(parent);
+    const root = join(parent, "artifacts");
+
+    await assertArtifactStorageWritable(root);
+
+    expect((await stat(root)).isDirectory()).toBe(true);
+    expect(await readdir(root)).toEqual([]);
+  });
+
+  test("names the path and the env var when the root cannot be written", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "useagent-artifacts-boot-"));
+    roots.add(parent);
+    // A regular file where the directory should be: mkdir and the probe both fail.
+    const blocked = join(parent, "not-a-directory");
+    await writeFile(blocked, "");
+
+    await expect(assertArtifactStorageWritable(blocked)).rejects.toThrow(
+      /artifact storage is not writable \((EEXIST|ENOTDIR)\) at .*not-a-directory: mount a writable directory there or point ARTIFACT_STORAGE_DIR at one/,
+    );
+  });
+});
+
+describe("LocalArtifactStorage", () => {
+  test("makes shared artifact directories traversable and bytes group-readable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const key = "a".repeat(64);
+    const storage = new LocalArtifactStorage(root);
+
+    const bytes = new TextEncoder().encode("durable");
+    await storage.put(key, bytes);
+
+    const directoryMode = (await stat(join(root, "aa"))).mode & 0o777;
+    const fileMode = (await stat(join(root, "aa", key))).mode & 0o777;
+    expect(directoryMode).toBe(0o770);
+    expect(fileMode).toBe(0o660);
+    expect(new TextDecoder().decode(await storage.read(key))).toBe("durable");
+    expect(await storage.sha256(key)).toBe(createHash("sha256").update(bytes).digest("hex"));
+  });
+
+  test("does not try to change ownership-sensitive mode on existing bytes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const key = "b".repeat(64);
+    const storage = new LocalArtifactStorage(root);
+
+    await storage.put(key, new TextEncoder().encode("shared"));
+    const target = join(root, "bb", key);
+    await chmod(target, 0o440);
+    await storage.put(key, new TextEncoder().encode("must-not-overwrite"));
+
+    expect((await stat(target)).mode & 0o777).toBe(0o440);
+    expect(new TextDecoder().decode(await storage.read(key))).toBe("shared");
+  });
+
+  test("preserves an existing shared digest directory owned by another publisher", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const key = "c".repeat(64);
+    const directory = join(root, "cc");
+    await mkdir(directory, { mode: 0o775 });
+    await chmod(directory, 0o775);
+    const storage = new LocalArtifactStorage(root);
+
+    await storage.put(key, new TextEncoder().encode("cross-service"));
+
+    expect((await stat(directory)).mode & 0o777).toBe(0o775);
+    expect(new TextDecoder().decode(await storage.read(key))).toBe("cross-service");
+  });
+
+  test("reclaims only old content-addressed bytes with no proven reference", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const referenced = "d".repeat(64);
+    const orphan = "e".repeat(64);
+    const invalid = "not-a-digest";
+    const storage = new LocalArtifactStorage(root);
+
+    await storage.put(referenced, new TextEncoder().encode("keep"));
+    await storage.put(orphan, new TextEncoder().encode("delete"));
+    await writeFile(join(root, "ee", invalid), "ignore");
+
+    const dryRun = await storage.reclaimUnreferenced({
+      referencedKeys: new Set([referenced]),
+      minAgeMs: 0,
+      now: new Date(Date.now() + 1_000),
+      dryRun: true,
+    });
+    expect(dryRun.removed).toEqual([orphan]);
+    expect(dryRun.warnings).toEqual([]);
+    expect(await storage.size(orphan)).toBe(6);
+
+    const result = await storage.reclaimUnreferenced({
+      referencedKeys: new Set([referenced]),
+      minAgeMs: 0,
+      now: new Date(Date.now() + 1_000),
+    });
+    expect(result.removed).toEqual([orphan]);
+    expect(new TextDecoder().decode(await storage.read(referenced))).toBe("keep");
+    await expect(storage.read(orphan)).rejects.toThrow("artifact bytes are missing");
+  });
+
+  test("ignores digest-prefix entries that are not real directories", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const storage = new LocalArtifactStorage(root);
+    await writeFile(join(root, "ff"), "not a directory");
+    await symlink(root, join(root, "ab"));
+
+    await expect(
+      storage.reclaimUnreferenced({ referencedKeys: new Set(), minAgeMs: 0 }),
+    ).resolves.toEqual({ scanned: 0, removed: [], retained: [], warnings: [] });
+  });
+
+  test("fails loudly when the storage root cannot be listed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const notDirectory = join(root, "not-a-directory");
+    await writeFile(notDirectory, "invalid root");
+
+    await expect(new LocalArtifactStorage(notDirectory).reclaimUnreferenced({
+      referencedKeys: new Set(),
+    })).rejects.toMatchObject({ code: "ENOTDIR" });
+  });
+
+  test("continues reclaiming after an inaccessible digest-prefix directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const inaccessible = "a".repeat(64);
+    const reclaimable = "b".repeat(64);
+    const storage = new LocalArtifactStorage(root);
+    await storage.put(inaccessible, new TextEncoder().encode("blocked"));
+    await storage.put(reclaimable, new TextEncoder().encode("remove"));
+    const inaccessibleDirectory = join(root, "aa");
+    await chmod(inaccessibleDirectory, 0);
+
+    try {
+      const result = await storage.reclaimUnreferenced({
+        referencedKeys: new Set(),
+        minAgeMs: 0,
+        now: new Date(Date.now() + 1_000),
+      });
+
+      expect(result).toEqual({
+        scanned: 1,
+        removed: [reclaimable],
+        retained: [],
+        warnings: [{
+          code: "permission_denied",
+          operation: "readdir",
+          path: inaccessibleDirectory,
+        }],
+      });
+      await expect(storage.read(reclaimable)).rejects.toThrow(
+        "artifact bytes are missing",
+      );
+    } finally {
+      await chmod(inaccessibleDirectory, 0o770);
+    }
+  });
+
+  test("restores quarantined bytes when a reference appears during reclaim", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const key = "1".repeat(64);
+    const storage = new LocalArtifactStorage(root);
+    await storage.put(key, new TextEncoder().encode("published-during-gc"));
+
+    const result = await storage.reclaimUnreferenced({
+      referencedKeys: new Set(),
+      minAgeMs: 0,
+      now: new Date(Date.now() + 1_000),
+      isReferenced: async () => true,
+    });
+
+    expect(result).toEqual({ scanned: 1, removed: [], retained: [key], warnings: [] });
+    expect(new TextDecoder().decode(await storage.read(key))).toBe("published-during-gc");
+  });
+
+  test("does not delete a fresh canonical copy published after quarantine", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const key = "2".repeat(64);
+    const storage = new LocalArtifactStorage(root);
+    await storage.put(key, new TextEncoder().encode("old"));
+
+    const result = await storage.reclaimUnreferenced({
+      referencedKeys: new Set(),
+      minAgeMs: 0,
+      now: new Date(Date.now() + 1_000),
+      isReferenced: async () => {
+        await storage.put(key, new TextEncoder().encode("fresh"));
+        return true;
+      },
+    });
+
+    expect(result).toEqual({ scanned: 1, removed: [], retained: [key], warnings: [] });
+    expect(new TextDecoder().decode(await storage.read(key))).toBe("fresh");
+  });
+
+  test("restores canonical bytes when the post-quarantine reference check fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const key = "3".repeat(64);
+    const storage = new LocalArtifactStorage(root);
+    await storage.put(key, new TextEncoder().encode("must-survive"));
+
+    await expect(storage.reclaimUnreferenced({
+      referencedKeys: new Set(),
+      minAgeMs: 0,
+      now: new Date(Date.now() + 1_000),
+      isReferenced: async () => { throw new Error("database unavailable"); },
+    })).rejects.toThrow("database unavailable");
+
+    expect(new TextDecoder().decode(await storage.read(key))).toBe("must-survive");
+  });
+
+  test("recovers a stale quarantine before evaluating the canonical key", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skynet-artifacts-"));
+    roots.add(root);
+    const key = "4".repeat(64);
+    const storage = new LocalArtifactStorage(root);
+    await storage.put(key, new TextEncoder().encode("recover-me"));
+    const path = join(root, "44", key);
+    await rename(path, `${path}.00000000-0000-4000-8000-000000000000.reclaim`);
+
+    const result = await storage.reclaimUnreferenced({
+      referencedKeys: new Set([key]),
+      minAgeMs: 0,
+      now: new Date(Date.now() + 1_000),
+    });
+
+    expect(result).toEqual({ scanned: 1, removed: [], retained: [key], warnings: [] });
+    expect(new TextDecoder().decode(await storage.read(key))).toBe("recover-me");
+  });
+});

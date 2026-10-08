@@ -1,0 +1,101 @@
+---
+title: Compose deployment
+description: Build immutable images, configure one backend per database, and promote a candidate without changing engine or sandbox contracts.
+sidebar:
+  order: 3
+---
+
+The repository ships separate backend, gateway, and frontend images. Compose is
+the current vendor-neutral application boundary: the same image contracts can
+run locally or on a single application host without making a sandbox provider
+part of the application stack.
+
+## Prerequisites
+
+- A Postgres 16 database with pgvector and the gateway database role.
+- An HTTPS gateway origin reachable from the selected sandbox provider.
+- Immutable backend, gateway, and frontend image references.
+- Backend, gateway, auth, encryption, and provider secrets stored outside the
+  Compose file.
+- One selected sandbox provider configuration: Box, Cube, or Daytona.
+- A compatible prebuilt runtime template for that engine/provider pair, or the
+  runtime prerequisites needed to prepare it: Bun for useAgent and Pi setup,
+  Node/npm tooling for the OpenCode fallback install, and the native engine
+  binary or package/build tools required by the pinned driver version.
+
+## Local parity stack
+
+Copy the example environment, replace every placeholder, and build from the
+exact commit:
+
+```bash
+cp deploy/compose/env.example .env.compose
+docker compose --env-file .env.compose -f compose.local.yaml up --build
+```
+
+The local project starts Postgres, backend, gateway, and frontend. Set
+`GATEWAY_PUBLIC_URL` to a real sandbox-reachable HTTPS origin; a Docker service
+name is not reachable from an external sandbox.
+
+Expected outcome: Postgres becomes healthy, then the backend, gateway, and
+frontend health checks pass. Open `http://localhost:3400` and confirm
+`GET /api/config` reports the selected release and provider.
+
+## Production image contract
+
+`compose.prod.yaml` accepts caller-supplied image references. Pass registry
+digests, not mutable tags:
+
+```text
+registry.example/useagent-backend@sha256:...
+registry.example/useagent-gateway@sha256:...
+registry.example/useagent-frontend@sha256:...
+```
+
+The backend and gateway need the same product feature flags and a consistent
+gateway origin, but they do not share an undifferentiated environment file. The
+gateway receives gateway-owned credentials only. Configure only the active
+sandbox provider credential; do not place several provider control keys in the
+same production environment as a fallback matrix.
+
+## Single backend per database
+
+Exactly one backend process may serve a database. Canonical sealing and SSE
+fan-out are process-local. Production must keep `REQUIRE_SINGLE_BACKEND=true`.
+
+This means a backend cutover is serialized:
+
+1. Build and health-check the candidate images without advertising them.
+2. Close run admission and drain current work.
+3. Stop the active backend.
+4. Start the candidate backend and run migrations, health, fingerprint, and
+   bounded smoke checks.
+5. Switch the reverse-proxy upstream and reopen admission.
+6. Keep the prior image and environment available for rollback.
+
+Frontend and gateway candidates may overlap where their contracts allow it.
+Two backends against one database may not.
+
+## Sandbox providers remain plugins
+
+Box, Cube, and Daytona implement `@useagent/sandbox-contract` in separate
+packages. Compose selects one provider through configuration; it does not
+change the engine protocol. Cube infrastructure, Box infrastructure, Daytona,
+host Postgres, and the reverse proxy remain outside the application Compose
+project.
+
+A template counts as ready only after a cold fork boots the native runtime with
+the expected user, home, workspace, binary versions, preview/DNS trust, and
+gateway reachability. Building a compatible template does not activate it;
+deployment configuration must select its exact id or snapshot name.
+
+## Promotion and rollback evidence
+
+A promotion should record the release commit, image digests, configuration
+fingerprint, migration result, health checks, and the engine/provider journeys
+actually run. Rollback stops the candidate backend, starts the prior image,
+verifies health, restores the upstream, and reopens admission.
+
+Do not describe a dark deployment as certified until the exact engine,
+credential mode, model, and sandbox-provider journeys pass. See
+[Verified support](/operations/verified-support).

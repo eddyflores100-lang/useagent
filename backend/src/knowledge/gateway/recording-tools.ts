@@ -1,0 +1,240 @@
+import { basename } from "node:path";
+import { publishSandboxArtifact } from "../../artifacts/publish";
+import type { ArtifactDescriptor } from "../../artifacts/repo";
+import { ensureSandboxDesktopView, type SandboxDesktop } from "../../engines/desktop";
+import { getRunForOrg } from "../../runs/repo";
+import { type SandboxHandle } from "../../sandboxes/provider";
+import { absoluteArtifactUrl, absoluteArtifactUrlContent } from "./artifact-links";
+import type { ToolTokenClaims } from "./token";
+import { resolveRunSandbox } from "../../sandboxes/binding";
+
+interface ToolResult {
+  content: Array<{ type: "text"; text: string }>;
+  structuredContent?: Record<string, unknown>;
+  isError?: boolean;
+}
+
+export interface RecordingMetadata {
+  readonly path: string;
+  readonly codec: "h264";
+  readonly width: number;
+  readonly height: number;
+  readonly durationSeconds: number;
+}
+
+interface RecordingStopResult {
+  readonly recording: RecordingMetadata;
+  readonly artifact: ArtifactDescriptor;
+  readonly created: boolean;
+}
+
+interface RecordingService {
+  start(claims: ToolTokenClaims, name: string): Promise<{ path: string }>;
+  stop(claims: ToolTokenClaims): Promise<RecordingStopResult>;
+}
+
+type DesktopReadiness = (
+  sandbox: SandboxHandle,
+  signal: AbortSignal,
+) => Promise<SandboxDesktop>;
+
+const NAME_RE = /^[A-Za-z0-9._-]+$/;
+const PATH_MARKER = "__USEAGENT_RECORDING_PATH__=";
+
+const result = (text: string, structuredContent?: Record<string, unknown>): ToolResult => ({
+  content: [{ type: "text", text }],
+  ...(structuredContent ? { structuredContent } : {}),
+});
+
+const failure = (text: string): ToolResult => ({
+  content: [{ type: "text", text }],
+  isError: true,
+});
+
+function checkedName(value: string): string {
+  const name = value.trim();
+  if (!name || name.length > 120 || !NAME_RE.test(name)) {
+    throw new Error("recording name may contain only letters, numbers, dot, underscore, and dash");
+  }
+  return name;
+}
+
+async function recordingSandbox(claims: ToolTokenClaims): Promise<SandboxHandle> {
+  const run = await getRunForOrg(claims.orgId, claims.runId);
+  if (!run || run.threadId !== claims.threadId) throw new Error("run not found in this thread");
+  if (!run.sandboxId) throw new Error("no sandbox is attached to this run");
+  return await resolveRunSandbox(run);
+}
+
+export async function startRecordingInSandbox(
+  sandbox: SandboxHandle,
+  name: string,
+  signal: AbortSignal,
+  ensureDesktop: DesktopReadiness = ensureSandboxDesktopView,
+): Promise<string> {
+  const recordingName = checkedName(name);
+  const desktop = await ensureDesktop(sandbox, signal);
+  if (!desktop.available) {
+    throw new Error(desktop.reason ?? "desktop failed readiness");
+  }
+  const started = await sandbox.process.executeCommand(
+    `skynet-record-start '${recordingName}'`,
+    undefined,
+    { DISPLAY: sandbox.desktop?.display ?? ":1" },
+    60,
+  );
+  const path = (started.result ?? "").trim().split("\n").at(-1)?.trim() ?? "";
+  if ((started.exitCode ?? 1) !== 0 || !path.endsWith(`/${recordingName}.mp4`)) {
+    throw new Error((started.result ?? "recording failed to start").trim());
+  }
+  return path;
+}
+
+export async function stopRecordingInSandbox(
+  sandbox: SandboxHandle,
+): Promise<RecordingMetadata> {
+  const stopped = await sandbox.process.executeCommand(
+    "path=$(skynet-record-stop) || exit $?; " +
+      `printf '${PATH_MARKER}%s\\n' \"$path\"; ` +
+      "ffprobe -v error -select_streams v:0 " +
+      "-show_entries stream=codec_name,width,height -show_entries format=duration " +
+      "-of default=noprint_wrappers=1 \"$path\"",
+    undefined,
+    undefined,
+    60,
+  );
+  const output = stopped.result ?? "";
+  if ((stopped.exitCode ?? 1) !== 0) {
+    throw new Error(output.trim() || "recording failed to stop");
+  }
+  const value = (key: string): string =>
+    new RegExp(`^${key}=(.+)$`, "m").exec(output)?.[1]?.trim() ?? "";
+  const path = value(PATH_MARKER.slice(0, -1));
+  const codec = value("codec_name");
+  const width = Number(value("width"));
+  const height = Number(value("height"));
+  const durationSeconds = Number(value("duration"));
+  if (
+    !path.endsWith(".mp4") ||
+    codec !== "h264" ||
+    !Number.isInteger(width) ||
+    width <= 0 ||
+    !Number.isInteger(height) ||
+    height <= 0 ||
+    !Number.isFinite(durationSeconds) ||
+    durationSeconds <= 0
+  ) {
+    throw new Error("finished recording failed ffprobe validation");
+  }
+  return { path, codec, width, height, durationSeconds };
+}
+
+const productionService: RecordingService = {
+  async start(claims, name) {
+    const sandbox = await recordingSandbox(claims);
+    return {
+      path: await startRecordingInSandbox(
+        sandbox,
+        name,
+        AbortSignal.timeout(60_000),
+      ),
+    };
+  },
+  async stop(claims) {
+    const sandbox = await recordingSandbox(claims);
+    const recording = await stopRecordingInSandbox(sandbox);
+    const published = await publishSandboxArtifact({
+      orgId: claims.orgId,
+      userId: claims.userId || null,
+      runId: claims.runId,
+      threadId: claims.threadId,
+      path: recording.path,
+      name: basename(recording.path),
+    });
+    return {
+      recording,
+      artifact: published.artifact,
+      created: published.created,
+    };
+  },
+};
+
+let serviceOverride: RecordingService | null = null;
+
+/** Test-only seam: production always uses the provider-backed service above. */
+export function setRecordingServiceForTest(service: RecordingService | null): void {
+  serviceOverride = service;
+}
+
+export const RECORDING_TOOLS = [
+  {
+    name: "desktop_recording_start",
+    aliases: ["record_start"],
+    description:
+      "Start recording the canonical sandbox desktop with its preinstalled FFmpeg/X11 recorder. Use it before computer actions " +
+      "when the user asks for a video.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Optional safe recording basename without .mp4.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "desktop_recording_stop",
+    aliases: ["record_stop"],
+    description:
+      "Stop the active canonical desktop recording, validate the MP4, and publish it as " +
+      "a durable authenticated UseAgent artifact. Returns working preview and download URLs.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+] as const;
+
+export const RECORDING_TOOL_NAMES: ReadonlySet<string> = new Set(
+  RECORDING_TOOLS.map((tool) => tool.name),
+);
+
+export async function executeRecordingTool(
+  claims: ToolTokenClaims,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<ToolResult> {
+  const service = serviceOverride ?? productionService;
+  try {
+    if (name === "desktop_recording_start") {
+      const requested = typeof args.name === "string" && args.name.trim()
+        ? args.name.trim().replace(/\.mp4$/i, "")
+        : `recording-${Date.now()}`;
+      const started = await service.start(claims, checkedName(requested));
+      return result(`Recording started: ${started.path}`, { recording: started });
+    }
+    if (name === "desktop_recording_stop") {
+      const stopped = await service.stop(claims);
+      return result(
+        `Recording complete: [${stopped.artifact.name}](${absoluteArtifactUrl(stopped.artifact.preview_url)}) ` +
+          `(${stopped.recording.codec}, ${stopped.recording.width}x${stopped.recording.height}, ` +
+          `${stopped.recording.durationSeconds.toFixed(2)}s). ` +
+          `[Download](${absoluteArtifactUrl(stopped.artifact.download_url)}) ` +
+          "Share these URLs exactly as written, never substitute another host.",
+        {
+          recording: stopped.recording,
+          artifact: stopped.artifact,
+          created: stopped.created,
+          ...absoluteArtifactUrlContent(stopped.artifact),
+        },
+      );
+    }
+    return failure(`Unknown tool: ${name}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "desktop recording failed";
+    return failure(`Could not ${name === "desktop_recording_stop" ? "stop" : "start"} recording: ${message}`);
+  }
+}

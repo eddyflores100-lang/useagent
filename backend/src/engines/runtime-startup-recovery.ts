@@ -1,0 +1,121 @@
+import type { SandboxHandle } from "../sandboxes/provider.js";
+import { restartRuntimeEnvironment } from "./runtime-environment.js";
+import {
+  invalidateRuntimeEnvironmentAccess,
+  requestRuntimeEnvironment,
+} from "./runtime-environment-client.js";
+import { runtimeThreadId } from "./runtime-orchestration.js";
+import { readRuntimeThreadView } from "./runtime-thread-read.js";
+import type { RuntimeProviderBridgeLease } from "./runtime-provider-bridge.js";
+import type { EngineRunContext } from "./types.js";
+import {
+  ExpectedSandboxMismatchError,
+  resolveExpectedSandbox,
+} from "../sandboxes/binding.js";
+
+const CODEX_STUCK_START_RECOVERY_MS = 30_000;
+
+interface RuntimeShellSnapshot {
+  readonly projects: readonly { readonly id: string }[];
+  readonly threads: readonly {
+    readonly id: string;
+    readonly lineage?: { readonly rootThreadId?: string | null } | null;
+  }[];
+}
+
+/** Threads in the runtime other than `threadId` and its own subagent children. */
+export function otherRuntimeThreads(shell: RuntimeShellSnapshot, threadId: string): RuntimeShellSnapshot["threads"] {
+  return shell.threads.filter((thread) => thread.id !== threadId && thread.lineage?.rootThreadId !== threadId);
+}
+
+export class RuntimeFirstActivityTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`The provider produced no first activity within ${timeoutMs}ms`);
+    this.name = "RuntimeFirstActivityTimeoutError";
+  }
+}
+
+export interface StuckCodexStartRecoveryDependencies {
+  readonly requestEnvironment: typeof requestRuntimeEnvironment;
+  readonly restart: typeof restartRuntimeEnvironment;
+  readonly invalidateAccess: typeof invalidateRuntimeEnvironmentAccess;
+  readonly cleanupSignal: () => AbortSignal;
+  readonly warn: (message: string, context: Record<string, unknown>) => void;
+  readonly resolveExpectedSandbox?: typeof resolveExpectedSandbox;
+}
+
+export interface StuckCodexStartRecoveryInput {
+  readonly error: unknown;
+  readonly ctx: Pick<EngineRunContext, "runId" | "threadId" | "signal" | "expectedSandbox">;
+  readonly sandbox: SandboxHandle;
+  readonly lease: Pick<RuntimeProviderBridgeLease, "authPath" | "close">;
+  readonly priorTurnId: string | null;
+  readonly dependencies?: StuckCodexStartRecoveryDependencies;
+}
+
+export interface StuckCodexStartRecoveryResult {
+  readonly error: unknown;
+  readonly stuckStartConfirmed: boolean;
+}
+
+const stuckCodexStartRecoveryDependencies: StuckCodexStartRecoveryDependencies = {
+  requestEnvironment: requestRuntimeEnvironment,
+  restart: restartRuntimeEnvironment,
+  invalidateAccess: invalidateRuntimeEnvironmentAccess,
+  cleanupSignal: () => AbortSignal.timeout(CODEX_STUCK_START_RECOVERY_MS),
+  warn: (message, context) => console.warn(message, context),
+};
+
+export async function recoverStuckCodexSubscriptionStart(
+  input: StuckCodexStartRecoveryInput,
+): Promise<StuckCodexStartRecoveryResult> {
+  if (
+    (!(input.error instanceof RuntimeFirstActivityTimeoutError) && !input.ctx.signal.aborted) ||
+    input.lease.authPath !== "subscription"
+  ) {
+    return { error: input.error, stuckStartConfirmed: false };
+  }
+  const dependencies = input.dependencies ?? stuckCodexStartRecoveryDependencies;
+  const signal = dependencies.cleanupSignal();
+  const threadId = runtimeThreadId(input.ctx);
+  let stuckStartConfirmed = false;
+  try {
+    let sandbox = input.sandbox;
+    if (input.ctx.expectedSandbox) {
+      if (sandbox.id !== input.ctx.expectedSandbox.sandboxId) {
+        throw new ExpectedSandboxMismatchError();
+      }
+      sandbox = await (dependencies.resolveExpectedSandbox ?? resolveExpectedSandbox)(
+        input.ctx.expectedSandbox,
+        input.ctx.threadId ?? input.ctx.runId,
+      );
+    }
+    const snapshot = await readRuntimeThreadView(sandbox, threadId, signal, dependencies.requestEnvironment);
+    if (
+      snapshot.thread.id !== threadId ||
+      (snapshot.thread.latestTurn?.turnId ?? null) !== input.priorTurnId ||
+      snapshot.thread.session?.status !== "starting"
+    ) {
+      return { error: input.error, stuckStartConfirmed: false };
+    }
+    const shell = await dependencies.requestEnvironment<RuntimeShellSnapshot>(
+      sandbox,
+      { method: "GET", path: "/api/orchestration/shell" },
+      signal,
+    );
+    if (!shell.threads.some((thread) => thread.id === threadId) || otherRuntimeThreads(shell, threadId).length > 0) {
+      return { error: input.error, stuckStartConfirmed: false };
+    }
+    stuckStartConfirmed = true;
+    await input.lease.close();
+    await dependencies.restart(sandbox, signal);
+    dependencies.invalidateAccess(sandbox);
+  } catch (recoveryError) {
+    dependencies.warn("Codex stuck-start runtime recovery failed", {
+      runId: input.ctx.runId,
+      threadId: input.ctx.threadId ?? input.ctx.runId,
+      cause: recoveryError,
+    });
+  }
+  return { error: input.error, stuckStartConfirmed };
+}

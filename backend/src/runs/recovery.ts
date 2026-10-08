@@ -1,0 +1,770 @@
+import {
+  resolveHarness,
+  resolveProviderDriverForSession,
+} from "../engines";
+import type {
+  HarnessCheckpoint,
+  HarnessReconciliation,
+  HarnessSessionHandle,
+} from "../engines/types";
+import { getLastStepAt, getRun, STALE_SUMMARY } from "./repo";
+import { finalizeRun, resolveDurableFinalizationOutcome } from "./finalize";
+import type { WriteFence } from "./provider-events";
+import { ingestReconciliationEvents, recordReconcilingMarker, LostClaimError } from "./recovery-event-capture";
+export { ingestReconciliationEvents, RUN_RECONCILING } from "./recovery-event-capture";
+import { orgSecretRedactor } from "../secrets/store";
+import {
+  bumpReconcile,
+  claimDueReconciles,
+  reconcileClaimHeldForUpdate,
+  deleteReconcile,
+  enqueueReconcile,
+  nextReconcileAction,
+  reconcileBackoffAt,
+  RECONCILE_PARK_BUDGET_MS,
+  type ReconcileEntry,
+} from "./reconcile-queue";
+import {
+  failCommandlessStaleRuns,
+  listActiveCommands,
+  settleCommandForRun,
+  type ActiveCommand,
+} from "../commands/dispatch";
+import { pumpThread } from "../worker";
+import { assertNever } from "../util/exhaustive";
+import { CANCEL_SUMMARY, hasRunCancelIntent } from "../commands/cancel";
+import {
+  parseProviderSessionBinding,
+  type ProviderSessionBinding,
+} from "@useagent/agent-harness/canonical";
+import {
+  providerProtocolIdentity,
+} from "@useagent/agent-harness/control";
+import { and, eq } from "drizzle-orm";
+import { db } from "../db/client";
+import { providerSessionAuthIsCurrent } from "../engines/provider-session-authority";
+import {
+  ExpectedSandboxMismatchError,
+  resolveExpectedSandbox,
+  resolveSandboxBindingForSandbox,
+} from "../sandboxes/binding";
+import { piBridgeManager } from "../engines/pi-rpc-bridge";
+import {
+  parseExpectedSandboxBinding,
+  type ExpectedSandboxBinding,
+} from "../sandboxes/expected-binding";
+import { refuseRecoveredApprovals, type RecoveredApprovalDependencies } from "./recovered-approvals";
+import {
+  COMPACT_TIMED_OUT_WAITING_SUMMARY,
+  compactRecoveryDeadlineMs,
+} from "../engines/runtime-compact-contract";
+
+export const INCOMPATIBLE_PROVIDER_SESSION_SUMMARY =
+  "This run stopped after an engine protocol upgrade. Retry the turn to start a fresh native session.";
+
+export const UNRECOVERABLE_SUMMARY =
+  "Interrupted - this run could not be recovered after the backend restarted. Reply to continue in this thread.";
+
+// ---------------------------------------------------------------------------
+// Restart recovery of the durable command lane (north star Phase 3 "Restart
+// recovery" + Crash Recovery Matrix). On boot the in-memory workers are gone,
+// so the mailbox on the `commands` table is the source of truth. Three phases:
+//
+//  1. RESOLVE each in-flight (dispatched) command against its run:
+//       running  → reconcile the native session (completed) or fail honestly,
+//                  then mark the command completed;
+//       terminal → mark the command completed (crash between run-done and the
+//                  command settle — Crash Matrix "provider completed while useAgent
+//                  says terminal"): frees the thread for the next turn;
+//       queued   → requeue the command (worker died before the run started).
+//  2. PUMP every thread with a queued command → dispatch its head (order +
+//     one-in-flight preserved by the mailbox); cross-thread concurrent.
+//  3. FAIL any non-terminal run with no active command (legacy/orphan).
+//
+// ONE-SHOT boot pass — no background loops. Bounded per-run probes run
+// concurrently, so total boot time is ~one probe budget.
+// ---------------------------------------------------------------------------
+
+/** Hard per-run backstop; the harness reconcile bounds its own work to ~9s. */
+const RECONCILE_BUDGET_MS = 11_000;
+
+/** The native-session probe (HarnessAdapter.reconcile). Injectable for tests. */
+export type ReconcileProbe = (
+  handle: HarnessSessionHandle,
+  checkpoint: HarnessCheckpoint,
+) => Promise<HarnessReconciliation>;
+
+/** Default probe: resolve the control adapter for the run's provider from the
+ *  engine registry (no direct concrete-harness import). A provider with no
+ *  registered harness surfaces as unreachable and is handled by the caller's
+ *  switch; a registered ACP harness honestly returns `unsupported_capability`.
+ *  For OpenCode runs this resolves to `opencodeHarness`, so behavior is unchanged. */
+const defaultReconcile: ReconcileProbe = (handle, checkpoint) => {
+  const harness = resolveHarness(handle.provider);
+  return harness
+    ? harness.reconcile(handle, checkpoint)
+    : Promise.resolve({ status: "unreachable" } as HarnessReconciliation);
+};
+
+export type RestartTransportCleanup = (input: {
+  readonly engine: string;
+  readonly sandboxId: string | null;
+  readonly threadId: string;
+  readonly expectedSandbox: ExpectedSandboxBinding | null;
+}) => Promise<void>;
+
+const defaultRestartTransportCleanup: RestartTransportCleanup = async (input) => {
+  if (input.engine !== "pi") return;
+  if (!input.sandboxId) throw new Error("Pi restart cleanup has no sandbox identity");
+  if (input.expectedSandbox && input.sandboxId !== input.expectedSandbox.sandboxId) {
+    throw new ExpectedSandboxMismatchError();
+  }
+  const sandbox = input.expectedSandbox
+    ? await resolveExpectedSandbox(input.expectedSandbox, input.threadId)
+    : await (await resolveSandboxBindingForSandbox(input.sandboxId)).provider.get(input.sandboxId);
+  await piBridgeManager.prepare(sandbox, input.expectedSandbox ?? undefined);
+};
+
+function recoveryMetadata(
+  expectedSandbox: ExpectedSandboxBinding | null,
+  threadId: string,
+  sandboxId: string | null,
+): Record<string, unknown> | undefined {
+  if (!expectedSandbox) return undefined;
+  if (sandboxId !== expectedSandbox.sandboxId) throw new ExpectedSandboxMismatchError();
+  return { expectedSandbox, threadId };
+}
+
+function recoveryNativeCommand(input: {
+  commandName: string | null;
+  commandProvider: string | null;
+  commandSessionId: string | null;
+  commandCatalogRevision: number | null;
+}): NonNullable<HarnessCheckpoint["eventContext"]>["nativeCommand"] {
+  return input.commandName
+    ? {
+        name: input.commandName,
+        provider: input.commandProvider,
+        sessionId: input.commandSessionId,
+        catalogRevision: input.commandCatalogRevision,
+      }
+    : undefined;
+}
+
+export interface RecoveryResult {
+  readonly reconciled: number;
+  readonly failed: number;
+  readonly redispatched: number;
+  /** Runs whose one-shot probe was transient and were PARKED for the adaptive
+   *  background re-probe instead of honest-failed at boot (#63). */
+  readonly parked: number;
+}
+
+export async function recoverStaleRuns(
+  reconcile: ReconcileProbe = defaultReconcile,
+  cleanup: RestartTransportCleanup = defaultRestartTransportCleanup,
+): Promise<RecoveryResult> {
+  const active = await listActiveCommands();
+
+  // Phase 1 — resolve in-flight commands (concurrent; different threads are
+  // independent, and a thread has at most one dispatched command).
+  const dispatched = active.filter((c) => c.state === "dispatched");
+  const resolutions = await Promise.all(dispatched.map((c) => resolveDispatchedOrFail(c, reconcile, cleanup)));
+  const reconciled = resolutions.filter((r) => r === "reconciled").length;
+  const parked = resolutions.filter((r) => r === "parked").length;
+  let failed = resolutions.filter((r) => r === "failed").length;
+
+  // Phase 2 — pump each distinct thread that had an active command. dispatched
+  // ones are now completed/requeued, so a queued head can claim the thread.
+  const threads = [...new Set(active.map((c) => c.threadId))];
+  const pumped = await Promise.all(threads.map((t) => pumpThread(t).catch((error) => {
+    console.error(`[boot] pump of thread ${t} failed; the next settle or boot pumps it:`, error);
+    return null;
+  })));
+  const redispatched = pumped.filter((runId) => runId !== null).length;
+
+  // Phase 3 — fail legacy/orphan non-terminal runs that never joined the lane.
+  failed += await failCommandlessStaleRuns(STALE_SUMMARY);
+
+  return { reconciled, failed, redispatched, parked };
+}
+
+type DispatchedResolution = "reconciled" | "failed" | "parked" | "settled" | "left";
+
+/** One run never stops boot. A run whose recovery throws (a Pi cleanup against a
+ *  gone sandbox, a finalize that cannot commit) is failed with an honest reason
+ *  and its command settled, so the thread is free and the next boot does not
+ *  replay the same failure. A Pi turn on that sandbox cleans stale writers again
+ *  before it starts. When even that cannot be written, the run is left for the
+ *  next boot and recovery moves on. */
+async function resolveDispatchedOrFail(
+  cmd: ActiveCommand,
+  reconcile: ReconcileProbe,
+  cleanup: RestartTransportCleanup,
+): Promise<DispatchedResolution> {
+  try {
+    return await resolveDispatched(cmd, reconcile, cleanup);
+  } catch (error) {
+    console.error(`[boot] recovery of run ${cmd.runId} failed; failing the run:`, error);
+  }
+  try {
+    const finalized = await finalizeRun(cmd.runId, "failed", UNRECOVERABLE_SUMMARY, 0);
+    const durable = await resolveDurableFinalizationOutcome(cmd.runId, finalized);
+    await settleCommandForRun(cmd.runId);
+    return durable?.status === "completed" ? "reconciled" : durable ? "failed" : "left";
+  } catch (error) {
+    console.error(`[boot] run ${cmd.runId} could not be failed; left for the next boot:`, error);
+    return "left";
+  }
+}
+
+/** Resolve one dispatched command: reconcile / fail / PARK a still-running run,
+ *  then settle its command (completed/requeued) so the thread is freed — EXCEPT a
+ *  parked run keeps its command dispatched (the thread stays reserved because the
+ *  run may still be running; the reconcile loop settles it later). */
+async function resolveDispatched(
+  cmd: ActiveCommand,
+  reconcile: ReconcileProbe,
+  cleanup: RestartTransportCleanup,
+): Promise<DispatchedResolution> {
+  let outcome: DispatchedResolution = "settled";
+  try {
+    if (cmd.expectedSandbox && cmd.threadId !== cmd.runThreadId) {
+      throw new ExpectedSandboxMismatchError();
+    }
+    if (cmd.engine === "pi") {
+      await cleanup({
+        engine: cmd.engine,
+        sandboxId: cmd.sandboxId,
+        threadId: cmd.runThreadId,
+        expectedSandbox: cmd.expectedSandbox,
+      });
+    }
+    if (cmd.runStatus === "running") {
+      outcome = await recoverRunningRun(cmd, reconcile);
+    }
+  } catch (error) {
+    if (!(error instanceof ExpectedSandboxMismatchError)) throw error;
+    if (cmd.runStatus === "running") {
+      const finalized = await finalizeRun(cmd.runId, "failed", error.message, 0);
+      const durable = await resolveDurableFinalizationOutcome(cmd.runId, finalized);
+      outcome = durable?.status === "completed" ? "reconciled" : "failed";
+    }
+  }
+  if (outcome === "parked") return outcome; // keep the command dispatched
+  // The run is now terminal (reconciled/failed) or was already terminal/queued;
+  // settle the command to completed (terminal) or requeued (queued).
+  await settleCommandForRun(cmd.runId);
+  return outcome;
+}
+
+async function recoverRunningRun(
+  cmd: ActiveCommand,
+  reconcile: ReconcileProbe,
+): Promise<"reconciled" | "failed" | "parked"> {
+  if (cmd.cancelRequested) {
+    const finalized = await finalizeRun(cmd.runId, "failed", CANCEL_SUMMARY, 0);
+    const durable = await resolveDurableFinalizationOutcome(cmd.runId, finalized);
+    return durable?.status === "completed" ? "reconciled" : "failed";
+  }
+  const binding = cmd.providerSession;
+  const authCurrent = binding
+    ? await providerSessionAuthIsCurrent({
+        binding,
+        orgId: cmd.orgId,
+        userId: cmd.userId,
+      })
+    : false;
+  const identityCurrent = Boolean(
+    binding &&
+    authCurrent &&
+    binding.runtime.kind === "sandbox" &&
+    binding.runtime.id === cmd.sandboxId &&
+    binding.nativeSessionId === cmd.engineSessionId,
+  );
+  const driver = binding && identityCurrent
+    ? resolveProviderDriverForSession(cmd.engine, binding, binding.authEpoch)
+    : undefined;
+  if (identityCurrent && !driver) {
+    const finalized = await finalizeRun(
+      cmd.runId,
+      "failed",
+      INCOMPATIBLE_PROVIDER_SESSION_SUMMARY,
+      0,
+    );
+    const durable = await resolveDurableFinalizationOutcome(cmd.runId, finalized);
+    return durable?.status === "completed" ? "reconciled" : "failed";
+  }
+  if (!identityCurrent) {
+    const finalized = await finalizeRun(cmd.runId, "failed", STALE_SUMMARY, 0);
+    const durable = await resolveDurableFinalizationOutcome(cmd.runId, finalized);
+    return durable?.status === "completed" ? "reconciled" : "failed";
+  }
+
+  const lastStepAt = await getLastStepAt(cmd.runId);
+  const redact = await orgSecretRedactor(cmd.orgId);
+  const metadata = recoveryMetadata(cmd.expectedSandbox, cmd.runThreadId, cmd.sandboxId);
+  const handle: HarnessSessionHandle = {
+    provider: binding!.provider,
+    sessionId: binding!.nativeSessionId,
+    sandboxId: binding!.runtime.id,
+    protocol: binding!.protocol,
+    generation: binding!.generation,
+    authEpoch: binding!.authEpoch,
+    currentAuthEpoch: binding!.authEpoch,
+  };
+
+  let result: HarnessReconciliation;
+  try {
+    result = await Promise.race([
+      reconcile(handle, {
+        sinceMs: lastStepAt?.getTime() ?? 0,
+        metadata,
+        eventContext: {
+          runId: cmd.runId,
+          threadId: cmd.runThreadId,
+          nativeCommand: recoveryNativeCommand(cmd),
+          redact,
+        },
+      }),
+      new Promise<HarnessReconciliation>((resolve) =>
+        setTimeout(() => resolve({ status: "unreachable" }), RECONCILE_BUDGET_MS),
+      ),
+    ]);
+  } catch (error) {
+    if (error instanceof ExpectedSandboxMismatchError) throw error;
+    result = { status: "unreachable" };
+  }
+
+  switch (result.status) {
+    case "completed":
+    case "failed": {
+      if (result.events?.length) {
+        try {
+          await ingestReconciliationEvents(cmd, redact, result.events, true);
+        } catch (error) {
+          try {
+            await parkRunningRun(cmd, binding!, lastStepAt);
+          } catch (parkError) {
+            throw new AggregateError(
+              [error, parkError],
+              `Terminal event backfill and retry parking failed for run ${cmd.runId}`,
+            );
+          }
+          console.error(`[reconcile] terminal event backfill for run ${cmd.runId} failed; parked for retry:`, error);
+          return "parked";
+        }
+      }
+      // Finalize only after the current native turn's tail is durable. Completed
+      // adoption still enqueues memory capture in the finalizer transaction;
+      // native failure/interruption keeps its specific recovered reason.
+      const finalized = await finalizeRun(cmd.runId, result.status, result.summary, 0);
+      const durable = await resolveDurableFinalizationOutcome(cmd.runId, finalized);
+      return durable?.status === "completed" ? "reconciled" : "failed";
+    }
+    case "in_progress":
+    case "no_change":
+    case "unreachable":
+    case "unsupported_capability": {
+      // ADAPTIVE (#63): the sandbox session may still be finishing after a fast
+      // restart. Instead of honest-failing NOW, PARK for a bounded background
+      // re-probe (the run stays `running`). enqueue is idempotent, so a re-boot
+      // re-parks against the ORIGINAL deadline. A freshly parked run gets the
+      // "reconciling" marker; a non-candidate already failed above.
+      await parkRunningRun(cmd, binding!, lastStepAt);
+      return "parked";
+    }
+    default:
+      return assertNever(result, "unhandled reconciliation status");
+  }
+}
+
+async function parkRunningRun(
+  cmd: ActiveCommand,
+  binding: ProviderSessionBinding,
+  lastStepAt: Date | null,
+): Promise<void> {
+  const now = Date.now();
+  const deadlineMs = cmd.commandName === "compact"
+    ? compactRecoveryDeadlineMs((lastStepAt ?? cmd.dispatchedAt).getTime(), cmd.promptDeliveredAt?.getTime())
+    : now + RECONCILE_PARK_BUDGET_MS;
+  const newlyParked = await enqueueReconcile({
+    runId: cmd.runId,
+    threadId: cmd.threadId,
+    sandboxId: binding.runtime.id,
+    sessionId: binding.nativeSessionId,
+    sinceAt: lastStepAt ?? new Date(now),
+    nextAttemptAt: reconcileBackoffAt(now, 0),
+    deadline: new Date(deadlineMs),
+  });
+  if (newlyParked) {
+    void recordReconcilingMarker(cmd.runId, cmd.threadId, {
+      reason: "boot-restart",
+      sinceMs: (lastStepAt ?? new Date(now)).getTime(),
+      deadlineMs,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive background reconcile loop (#63). Re-probes parked runs on a short
+// backoff within their budget: adopt the finished session, honest-fail after the
+// deadline, else reschedule. Single-flight with a watchdog; because the watchdog can
+// resurrect a tick over one that is merely slow, every claim is a leased row lock
+// (reconcile-queue.ts), so two ticks in flight never probe the same run. Never throws;
+// a tick error is logged.
+// ---------------------------------------------------------------------------
+
+/** Parked runs one tick processes at most. */
+const RECONCILE_BATCH = 20;
+
+// Every row write for a claimed entry is fenced on the lease the claim holds. The probe
+// race is bounded (RECONCILE_BUDGET_MS) but the reads and the finalize around it are not,
+// so a tick can outlive its lease; once the watchdog has resurrected a replacement and it
+// has re-claimed the row, the stale tick learns it here and leaves the row alone. Its
+// probe was wasted, nothing else: finalization is first-writer-wins on its own.
+function lostClaim(entry: ReconcileEntry): void {
+  console.warn(
+    `[reconcile] entry ${entry.runId} outlived its lease and was re-claimed by another tick; leaving the row to it`,
+  );
+}
+async function settleEntry(entry: ReconcileEntry): Promise<boolean> {
+  const held = await deleteReconcile(entry.runId, entry.leaseUntil);
+  if (!held) lostClaim(entry);
+  return held;
+}
+async function rescheduleEntry(entry: ReconcileEntry): Promise<boolean> {
+  const next = reconcileBackoffAt(Date.now(), entry.attempts);
+  const held = await bumpReconcile(entry.runId, next, entry.leaseUntil);
+  if (!held) lostClaim(entry);
+  return held;
+}
+/** The fence every write this tick makes for the run carries: its claim row, locked. */
+const claimFence = (entry: ReconcileEntry): WriteFence =>
+  (tx) => reconcileClaimHeldForUpdate(entry.runId, entry.leaseUntil, tx);
+
+/** Finalize a parked run only while this tick still owns its row. The fenced delete of
+ *  the parked row IS the ownership guard and runs inside the finalization transaction
+ *  (finalizeRun `claim`), so both commit together: a tick whose row was re-claimed by its
+ *  replacement writes nothing, and a crash can never leave a settled run parked. Returns
+ *  the durable outcome, or null when the claim was lost. */
+async function finalizeOwned(
+  entry: ReconcileEntry,
+  status: "completed" | "failed",
+  summary: string,
+): Promise<Awaited<ReturnType<typeof resolveDurableFinalizationOutcome>> | null> {
+  let held = false;
+  const finalized = await finalizeRun(entry.runId, status, summary, 0, {
+    publicationClaim: (tx) => reconcileClaimHeldForUpdate(entry.runId, entry.leaseUntil, tx),
+    claim: async (tx) => {
+      held = await deleteReconcile(entry.runId, entry.leaseUntil, tx);
+      return held;
+    },
+  });
+  if (!held) {
+    lostClaim(entry);
+    return null;
+  }
+  const durable = await resolveDurableFinalizationOutcome(entry.runId, finalized);
+  await settleAndPump(entry.runId, entry.threadId);
+  return durable;
+}
+
+/** One reconcile tick: process every DUE parked run. Returns counts for
+ *  tests/telemetry. The probe is injectable (tests). Never throws. */
+export async function runDueReconciles(
+  reconcile: ReconcileProbe = defaultReconcile,
+  cleanup: RestartTransportCleanup = defaultRestartTransportCleanup,
+  approvals: RecoveredApprovalDependencies = {},
+): Promise<{ adopted: number; failed: number; retried: number; dropped: number; lost: number; eventsRecovered: number }> {
+  let adopted = 0;
+  let failed = 0;
+  let retried = 0;
+  let dropped = 0;
+  let lost = 0;
+  let eventsRecovered = 0;
+  // Claim ONE leased row at a time: the lease then covers exactly the entry being probed,
+  // so a batch that outlives one lease never re-exposes a row it has yet to reach, and a
+  // tick running alongside this one claims disjoint rows.
+  for (let claimed = 0; claimed < RECONCILE_BATCH; claimed++) {
+    const [entry] = await claimDueReconciles(1);
+    if (!entry) break;
+   // PER-ENTRY ISOLATION: a throw on ONE entry (a stuck finalize, a DB error)
+   // must not abort the whole batch and leave every other parked run stranded.
+   // Combined with the tick watchdog in startReconcileLoop, a single wedged
+   // entry can no longer freeze the reconciler for all runs (the 2026-08-20
+   // 25-minute idle: one post-park tick never settled, single-flight then
+   // blocked every later tick forever).
+   try {
+    // NO-DOUBLE-ADOPT: if the run already settled via another lane (a reply's
+    // worker took the thread, a cancel, a prior tick), just drop the parked row.
+    const run = await getRun(entry.runId);
+    if (!run || run.status !== "running") {
+      if (await settleEntry(entry)) {
+        dropped++;
+        // The lane that settled the run may not have freed its thread.
+        await settleAndPump(entry.runId, entry.threadId);
+      } else lost++;
+      continue;
+    }
+    const expectedSandbox = parseExpectedSandboxBinding(run.expectedSandbox);
+    const queueIdentityAgrees = entry.threadId === run.threadId &&
+      entry.sandboxId === run.sandboxId &&
+      entry.sessionId === run.engineSessionId &&
+      (!expectedSandbox || entry.sandboxId === expectedSandbox.sandboxId);
+    if (expectedSandbox && !queueIdentityAgrees) throw new ExpectedSandboxMismatchError();
+    if (run.engine === "pi" && queueIdentityAgrees) {
+      await cleanup({
+        engine: run.engine,
+        sandboxId: run.sandboxId,
+        threadId: run.threadId,
+        expectedSandbox,
+      });
+    }
+    if (run.orgId && await hasRunCancelIntent(run.orgId, run.id)) {
+      const durable = await finalizeOwned(entry, "failed", CANCEL_SUMMARY);
+      if (!durable) lost++;
+      else if (durable.status === "completed") adopted++;
+      else failed++;
+      continue;
+    }
+    const binding = parseProviderSessionBinding(run.providerSession);
+    const authCurrent = binding
+      ? await providerSessionAuthIsCurrent({ binding, orgId: run.orgId, userId: run.userId })
+      : false;
+    const redact = await orgSecretRedactor(run.orgId);
+    const result = await probeParked(
+      entry,
+      authCurrent ? binding : null,
+      redact,
+      reconcile,
+      expectedSandbox,
+      run.threadId,
+      run.sandboxId,
+      run.engineSessionId,
+      recoveryNativeCommand(run),
+    );
+    // CONTINUITY (#63): ingest reachable native activity before deciding whether
+    // to retry or adopt. Completed-event ingestion is strict because finalization
+    // seals the run; in-progress activity remains best-effort timeline continuity.
+    // A provider that cannot surface events (ACP) simply returns none.
+    const recoveredEvents = result.status === "completed" ||
+      result.status === "failed" ||
+      result.status === "in_progress"
+      ? result.events
+      : undefined;
+    let recovered = 0;
+    try {
+      // Recovered events are upserts on stable ids, so a tick that stalled and lost its
+      // claim must not write them over its replacement's newer payloads: every write is
+      // fenced on the locked claim row inside its own transaction.
+      recovered = recoveredEvents?.length
+        ? await ingestReconciliationEvents(entry, redact, recoveredEvents, result.status !== "in_progress", claimFence(entry))
+        : 0;
+    } catch (error) {
+      if (error instanceof LostClaimError) {
+        eventsRecovered += error.recovered; // what landed before the claim was lost stays counted
+        lostClaim(entry);
+        lost++;
+        continue;
+      }
+      console.error(`[reconcile] terminal event backfill for run ${entry.runId} failed; retained for retry:`, error);
+      if (nextReconcileAction(false, Date.now(), entry.deadlineMs) === "fail") {
+        const durable = await finalizeOwned(entry, "failed", STALE_SUMMARY);
+        if (!durable) lost++;
+        else if (durable.status === "completed") adopted++;
+        else failed++;
+        continue;
+      }
+      if (await rescheduleEntry(entry)) retried++;
+      else lost++;
+      continue;
+    }
+    eventsRecovered += recovered;
+    // The old process's observer that answered a read-only run's own requests is gone.
+    if (run.permissionMode === "read-only" && binding && recoveredEvents?.length) {
+      await refuseRecoveredApprovals(
+        { runId: run.id, threadId: run.threadId, sessionId: binding.nativeSessionId, expectedSandbox, events: recoveredEvents },
+        approvals,
+      );
+    }
+    if (result.status === "failed") {
+      const durable = await finalizeOwned(entry, "failed", result.summary);
+      if (!durable) lost++;
+      else if (durable.status === "completed") adopted++;
+      else failed++;
+      continue;
+    }
+    const action = nextReconcileAction(result.status === "completed", Date.now(), entry.deadlineMs);
+    if (action === "adopt") {
+      const durable = await finalizeOwned(entry, "completed", (result as { summary: string }).summary);
+      if (!durable) lost++;
+      else if (durable.status === "completed") adopted++;
+      else failed++;
+    } else if (action === "fail") {
+      const durable = await finalizeOwned(
+        entry,
+        "failed",
+        run.commandName === "compact" ? COMPACT_TIMED_OUT_WAITING_SUMMARY : STALE_SUMMARY,
+      );
+      if (!durable) lost++;
+      else if (durable.status === "completed") adopted++;
+      else failed++;
+    } else {
+      // Retry: heartbeat the reconciling marker so the row shows liveness — but
+      // ONLY when we actually reached the session (in_progress / no_change). An
+      // unreachable probe learns nothing, so it must not fake a heartbeat.
+      if (result.status === "in_progress" || result.status === "no_change") {
+        // Awaited: the fenced heartbeat must land while this tick's lease is still the
+        // row's, which the reschedule below replaces.
+        await recordReconcilingMarker(entry.runId, entry.threadId, {
+          reason: "reprobe",
+          sinceMs: entry.sinceMs,
+          deadlineMs: entry.deadlineMs,
+          lastProbeAt: Date.now(),
+          eventsRecovered: recovered,
+        }, claimFence(entry));
+      }
+      if (await rescheduleEntry(entry)) retried++;
+      else lost++;
+    }
+   } catch (err) {
+     if (err instanceof ExpectedSandboxMismatchError) {
+       try {
+         const durable = await finalizeOwned(entry, "failed", err.message);
+         if (!durable) lost++;
+         else if (durable.status === "completed") adopted++;
+         else failed++;
+       } catch (finalizeError) {
+         console.error(`[reconcile] expected sandbox failure for run ${entry.runId} could not settle:`, finalizeError);
+         if (await rescheduleEntry(entry).catch(() => false)) retried++;
+         else lost++;
+       }
+       continue;
+     }
+     // Bump this entry's next attempt so a persistently failing one backs off
+     // instead of hot-looping, and move on to the rest of the batch.
+     console.error(`[reconcile] entry ${entry.runId} failed, skipping:`, err);
+     if (await rescheduleEntry(entry).catch(() => false)) retried++;
+     else lost++;
+   }
+  }
+  return { adopted, failed, retried, dropped, lost, eventsRecovered };
+}
+
+/** Bounded native-session re-probe for one parked entry. Never throws. */
+async function probeParked(
+  entry: ReconcileEntry,
+  binding: ProviderSessionBinding | null,
+  redact: Awaited<ReturnType<typeof orgSecretRedactor>>,
+  reconcile: ReconcileProbe,
+  expectedSandbox: ExpectedSandboxBinding | null,
+  runThreadId: string,
+  runSandboxId: string | null,
+  runSessionId: string | null,
+  nativeCommand: NonNullable<HarnessCheckpoint["eventContext"]>["nativeCommand"],
+): Promise<HarnessReconciliation> {
+  if (
+    !binding ||
+    entry.threadId !== runThreadId ||
+    entry.sandboxId !== runSandboxId ||
+    entry.sessionId !== runSessionId ||
+    binding.runtime.kind !== "sandbox" ||
+    binding.runtime.id !== entry.sandboxId ||
+    binding.nativeSessionId !== entry.sessionId
+  ) {
+    return { status: "unreachable" };
+  }
+  const handle: HarnessSessionHandle = {
+    provider: binding.provider,
+    sessionId: binding.nativeSessionId,
+    sandboxId: binding.runtime.id,
+    protocol: binding.protocol,
+    generation: binding.generation,
+    authEpoch: binding.authEpoch,
+    currentAuthEpoch: binding.authEpoch,
+  };
+  const metadata = recoveryMetadata(expectedSandbox, entry.threadId, entry.sandboxId);
+  try {
+    return await Promise.race([
+      reconcile(handle, {
+        sinceMs: entry.sinceMs,
+        metadata,
+        eventContext: { runId: entry.runId, threadId: entry.threadId, nativeCommand, redact },
+      }),
+      new Promise<HarnessReconciliation>((resolve) =>
+        setTimeout(() => resolve({ status: "unreachable" }), RECONCILE_BUDGET_MS),
+      ),
+    ]);
+  } catch (error) {
+    if (error instanceof ExpectedSandboxMismatchError) throw error;
+    return { status: "unreachable" };
+  }
+}
+
+/** Settle the just-finalized run's command and pump the thread's next turn —
+ *  the same free-the-thread step the live worker runs on every terminal. */
+async function settleAndPump(runId: string, threadId: string): Promise<void> {
+  await settleCommandForRun(runId).catch((err) =>
+    console.error(`[reconcile] settle command for run ${runId} failed:`, err),
+  );
+  await pumpThread(threadId).catch((err) =>
+    console.error(`[reconcile] pump thread ${threadId} failed:`, err),
+  );
+}
+
+let reconcileTimer: ReturnType<typeof setInterval> | null = null;
+
+export interface TickStart { readonly generation: number; readonly resurrected: boolean }
+
+/** Single-flight guard with a watchdog and tick OWNERSHIP. `start` hands out a generation
+ *  when a tick may run: nothing is in flight, or the in-flight tick is past the watchdog
+ *  and is treated as lost. `settle` frees the guard only for the generation that holds
+ *  it, so a lost tick that finally settles cannot free the guard from under its
+ *  replacement (which would let the next interval start a third tick over the second).
+ *  Pure, so it is tested without timers. */
+export function createTickGuard(watchdogMs: number) {
+  let generation = 0;
+  let inFlight: { generation: number; startedAt: number } | null = null;
+  return {
+    start(now: number): TickStart | null {
+      if (inFlight && now - inFlight.startedAt < watchdogMs) return null;
+      const resurrected = inFlight !== null;
+      inFlight = { generation: ++generation, startedAt: now };
+      return { generation: inFlight.generation, resurrected };
+    },
+    settle(gen: number): void {
+      if (inFlight?.generation === gen) inFlight = null;
+    },
+  };
+}
+
+/** Start the adaptive reconcile loop (idempotent). Single-flight: a slow tick is
+ *  never overlapped by the next. `RECONCILE_TICK_MS` overrides the interval
+ *  (tests go fast). Best-effort — a tick failure is logged, never thrown.
+ *
+ *  WATCHDOG: single-flight used to be permanent - if a tick's promise never
+ *  settled (an unbounded DB await wedged), the flag stayed set and every later
+ *  interval early-returned, killing the reconciler for good (the 2026-08-20
+ *  25-minute idle). A tick still in flight past the watchdog window is treated as
+ *  lost and a fresh tick starts. The guard tracks which tick owns the flag, so the
+ *  lost tick settling late does not free it, and the leased claims in
+ *  reconcile-queue.ts keep the two ticks off the same rows in the meantime. */
+export function startReconcileLoop(
+  intervalMs = Number(process.env.RECONCILE_TICK_MS ?? 15_000),
+): void {
+  if (reconcileTimer) return;
+  const watchdogMs = Math.max(intervalMs * 8, 120_000);
+  const guard = createTickGuard(watchdogMs);
+  reconcileTimer = setInterval(() => {
+    const tick = guard.start(Date.now());
+    if (!tick) return;
+    if (tick.resurrected) {
+      console.error(`[reconcile] tick exceeded ${watchdogMs}ms watchdog; starting a fresh tick`);
+    }
+    void runDueReconciles()
+      .catch((err) => console.error("[reconcile] tick failed:", err))
+      .finally(() => guard.settle(tick.generation));
+  }, intervalMs);
+  if (typeof reconcileTimer.unref === "function") reconcileTimer.unref();
+}
