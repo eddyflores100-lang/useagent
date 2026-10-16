@@ -8,7 +8,7 @@
 // and folds once it settled; the reader's toggle wins afterwards.
 
 import { RiArrowDownSLine } from "@remixicon/react";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   childElapsedMs,
   childStatusLabel,
@@ -106,6 +106,15 @@ export function SubagentRow({
     );
     return traceRowsFromWork(nodes, active).filter((row) => row.kind === "step");
   }, [steps, active, status]);
+  // One stable callback per child fold (not per row per render): TraceRowView
+  // is memoized, and a fresh inline arrow would defeat that memo on every
+  // render of a live child.
+  const toggleStep = useCallback(
+    (key: string) => {
+      setStepExpansion((current) => ({ ...current, [key]: !(current[key] ?? false) }));
+    },
+    [setStepExpansion],
+  );
   const meta = [
     formatChildEngineModel(null, fidelity?.model),
     fidelity?.usage ? `${formatSubagentTokenCount(fidelity.usage.totalTokens)} tok` : null,
@@ -171,9 +180,7 @@ export function SubagentRow({
               key={row.key}
               row={row}
               expanded={stepExpansion[row.key] ?? false}
-              onToggle={(key) =>
-                setStepExpansion((current) => ({ ...current, [key]: !(current[key] ?? false) }))
-              }
+              onToggle={toggleStep}
               highlighted={false}
             />
           ))}

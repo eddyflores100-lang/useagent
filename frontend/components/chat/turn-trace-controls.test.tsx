@@ -4,6 +4,8 @@ import { TraceControlsBar, type TraceControlsModel } from "./turn-trace-controls
 import {
   anyStepExpanded,
   applyAllSteps,
+  boundedErrorReveal,
+  ERROR_REVEAL_ROWS,
   traceControlsModel,
 } from "./turn-trace-controls";
 import { TraceRowView, TurnTrace } from "./turn-trace";
@@ -53,6 +55,45 @@ describe("trace controls model", () => {
       step({ key: "fail-b", status: "failed" }),
     ]);
     expect(model.firstFailedKey).toBe("fail-a");
+  });
+});
+
+describe("bounded error reveal", () => {
+  const tenK: TraceRow[] = Array.from({ length: 10_000 }, (_, i) =>
+    step({ key: `s-${i}`, body: PROSE, status: i === 5_000 ? "failed" : "done" }),
+  );
+
+  test("jumping bounds the reveal to a window around the error, not the trace", () => {
+    const win = boundedErrorReveal(tenK, "s-5000");
+    expect(win).toEqual({ from: 5_000 - ERROR_REVEAL_ROWS, to: 5_001 + ERROR_REVEAL_ROWS });
+    if (win) expect(win.to - win.from).toBeLessThan(60);
+  });
+
+  test("the window clamps at the row range's edges", () => {
+    expect(boundedErrorReveal(tenK, "s-3")).toEqual({ from: 0, to: 3 + 1 + ERROR_REVEAL_ROWS });
+    expect(boundedErrorReveal(tenK, "s-9999")).toEqual({
+      from: 9_999 - ERROR_REVEAL_ROWS,
+      to: 10_000,
+    });
+  });
+
+  test("a key outside the rows reveals nothing", () => {
+    expect(boundedErrorReveal(tenK, "missing")).toBeNull();
+  });
+
+  test("two traces each carry their own scoped subtree for the jump lookup", () => {
+    const failed = [step({ key: "failure", status: "failed", body: PROSE })];
+    const html =
+      renderToStaticMarkup(
+        <TurnTrace rows={failed} header={HEADER} live={false} defaultOpen={true} />,
+      ) +
+      renderToStaticMarkup(
+        <TurnTrace rows={failed} header={HEADER} live={false} defaultOpen={true} />,
+      );
+    // The duplicated key is exactly why the lookup is scoped to one trace's
+    // section ref (TurnTrace) rather than the document.
+    expect(html.split('data-row-key="failure"').length - 1).toBe(2);
+    expect(html.split('data-testid="turn-trace"').length - 1).toBe(2);
   });
 });
 

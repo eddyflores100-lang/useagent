@@ -8,8 +8,14 @@
 // the changed-files tree's collapse-all button, on our semantic tokens.
 
 import { RiContractUpDownLine, RiErrorWarningLine, RiExpandUpDownLine } from "@remixicon/react";
-import { cx as cn } from "@/utils/cx";
+import { Button } from "@/components/base/buttons/button";
 import type { TraceRow } from "./turn-trace-model";
+
+/** Rows revealed on each side of the jumped error. Jumping must never unbound
+ *  the fold: on a 10,000-step trace, one click used to mount every row (and,
+ *  after Expand all, every payload too). The window is symmetric and bounded,
+ *  with the row grammar's own "Show N steps" affordances covering the rest. */
+export const ERROR_REVEAL_ROWS = 24;
 
 /** What the controls act on: which steps can open a payload, and the first
  *  failed one, if any. */
@@ -48,8 +54,22 @@ export function applyAllSteps(
   return next;
 }
 
-const CONTROL_CLASS =
-  "flex min-h-7 w-fit cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[12px] text-text-tertiary transition-colors hover:bg-background-primary-hover hover:text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-border-focus-ring";
+/** The bounded reveal window around the failed row `failedKey`: at most
+ *  `contextRows` steps of context on each side, clamped to the row range.
+ *  Pure so the bounds stay testable without a DOM. Returns null when the key
+ *  is not in `rows` (nothing to reveal). */
+export function boundedErrorReveal(
+  rows: readonly TraceRow[],
+  failedKey: string,
+  contextRows: number = ERROR_REVEAL_ROWS,
+): { from: number; to: number } | null {
+  const index = rows.findIndex((row) => row.key === failedKey);
+  if (index < 0) return null;
+  return {
+    from: Math.max(0, index - contextRows),
+    to: Math.min(rows.length, index + 1 + contextRows),
+  };
+}
 
 /** "Collapse all / Expand all" plus "Jump to error". The jump control renders
  *  only when the caller found a failed step; both are real buttons with
@@ -67,29 +87,27 @@ export function TraceControlsBar({
 }) {
   return (
     <div data-testid="trace-controls" className="flex items-center gap-2">
-      <button
+      <Button
         type="button"
+        variant="ghost"
+        size="xs"
         aria-label={anyExpanded ? "Collapse all steps" : "Expand all steps"}
         onClick={onToggleAll}
-        className={CONTROL_CLASS}
+        leadingIcon={anyExpanded ? RiContractUpDownLine : RiExpandUpDownLine}
       >
-        {anyExpanded ? (
-          <RiContractUpDownLine className="size-3.5" aria-hidden />
-        ) : (
-          <RiExpandUpDownLine className="size-3.5" aria-hidden />
-        )}
-        <span>{anyExpanded ? "Collapse all" : "Expand all"}</span>
-      </button>
+        {anyExpanded ? "Collapse all" : "Expand all"}
+      </Button>
       {canJump && (
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="xs"
           aria-label="Jump to first error"
           onClick={onJumpToError}
-          className={cn(CONTROL_CLASS, "text-text-secondary")}
+          leadingIcon={RiErrorWarningLine}
         >
-          <RiErrorWarningLine className="size-3.5" aria-hidden />
-          <span>Jump to error</span>
-        </button>
+          Jump to error
+        </Button>
       )}
     </div>
   );
