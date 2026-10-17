@@ -446,7 +446,7 @@ export function TurnTrace({
                 extendRevealForward(current ?? { from: hidden, to: shownTo }, rows.length),
               )
             }
-            className="flex min-h-7 w-fit items-center rounded-md px-1.5 py-0.5 text-[12px] text-text-tertiary transition-colors hover:bg-background-primary-hover hover:text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-border-focus-ring"
+            className="flex min-h-7 w-fit items-center rounded-md px-1.5 py-0.5 text-caption-1-regular text-text-tertiary transition-colors hover:bg-background-primary-hover hover:text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-border-focus-ring"
           >
             Show {laterCount} later {laterCount === 1 ? "step" : "steps"}
           </button>
