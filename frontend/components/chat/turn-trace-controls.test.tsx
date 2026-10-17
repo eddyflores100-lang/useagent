@@ -1,14 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import { TraceControlsBar, type TraceControlsModel } from "./turn-trace-controls";
+import { TraceRowView, TurnTrace } from "./turn-trace";
 import {
   anyStepExpanded,
   applyAllSteps,
   boundedErrorReveal,
   ERROR_REVEAL_ROWS,
+  extendRevealForward,
+  TraceControlsBar,
+  type TraceControlsModel,
   traceControlsModel,
 } from "./turn-trace-controls";
-import { TraceRowView, TurnTrace } from "./turn-trace";
 import type { TraceHeader, TraceRow, TraceStepRow } from "./turn-trace-model";
 
 function step(over: Partial<TraceStepRow>): TraceStepRow {
@@ -77,6 +79,22 @@ describe("bounded error reveal", () => {
     });
   });
 
+  test("walking forward pages a bounded chunk per click, never to the edge", () => {
+    const start = boundedErrorReveal(tenK, "s-3");
+    if (!start) throw new Error("unreachable");
+    let win = start;
+    for (let i = 0; i < 5; i++) {
+      win = extendRevealForward(win, tenK.length);
+      expect(win.from).toBe(0);
+      expect(win.to - win.from).toBeLessThan(start.to - start.from + 6 * ERROR_REVEAL_ROWS);
+      expect(win.to).toBeLessThan(tenK.length);
+    }
+    // The edge clamps and stays clamped.
+    const last = extendRevealForward({ from: 0, to: tenK.length - 1 }, tenK.length);
+    expect(last).toEqual({ from: 0, to: tenK.length });
+    expect(extendRevealForward(last, tenK.length)).toEqual(last);
+  });
+
   test("a key outside the rows reveals nothing", () => {
     expect(boundedErrorReveal(tenK, "missing")).toBeNull();
   });
@@ -124,6 +142,7 @@ describe("TraceControlsBar", () => {
     const html = renderToStaticMarkup(
       <TraceControlsBar
         anyExpanded={false}
+        canToggleAll={true}
         canJump={false}
         onToggleAll={() => {}}
         onJumpToError={() => {}}
@@ -138,6 +157,7 @@ describe("TraceControlsBar", () => {
     const html = renderToStaticMarkup(
       <TraceControlsBar
         anyExpanded={true}
+        canToggleAll={true}
         canJump={true}
         onToggleAll={() => {}}
         onJumpToError={() => {}}
@@ -145,6 +165,21 @@ describe("TraceControlsBar", () => {
     );
     expect(html).toContain('aria-label="Collapse all steps"');
     expect(html).toContain(">Collapse all<");
+    expect(html).toContain('aria-label="Jump to first error"');
+  });
+
+  test("a turn with nothing to expand gets no no-op all-toggle", () => {
+    const html = renderToStaticMarkup(
+      <TraceControlsBar
+        anyExpanded={false}
+        canToggleAll={false}
+        canJump={true}
+        onToggleAll={() => {}}
+        onJumpToError={() => {}}
+      />,
+    );
+    expect(html).not.toContain("Expand all");
+    expect(html).not.toContain("Collapse all");
     expect(html).toContain('aria-label="Jump to first error"');
   });
 });

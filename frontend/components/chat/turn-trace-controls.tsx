@@ -71,32 +71,50 @@ export function boundedErrorReveal(
   };
 }
 
-/** "Collapse all / Expand all" plus "Jump to error". The jump control renders
- *  only when the caller found a failed step; both are real buttons with
- *  accessible names, so they are keyboard reachable by tab order. */
+/** The reveal window after one "Show N later steps" click: the same window
+ *  extended by one bounded chunk, never past the trace's edge. Walking to the
+ *  end is many bounded clicks, never one unbounded render. Pure for the same
+ *  reason as `boundedErrorReveal`. */
+export function extendRevealForward(
+  current: { from: number; to: number },
+  total: number,
+  chunk: number = ERROR_REVEAL_ROWS,
+): { from: number; to: number } {
+  return { from: current.from, to: Math.min(total, current.to + chunk) };
+}
+
+/** "Collapse all / Expand all" plus "Jump to error". Each control renders only
+ *  when it has something to do: the all-toggle when the turn has an expandable
+ *  step (a failure-only trace with no payloads gets no no-op button), the jump
+ *  when the caller found a failed step. Both are real buttons with accessible
+ *  names, so they are keyboard reachable by tab order. */
 export function TraceControlsBar({
   anyExpanded,
+  canToggleAll,
   canJump,
   onToggleAll,
   onJumpToError,
 }: {
   anyExpanded: boolean;
+  canToggleAll: boolean;
   canJump: boolean;
   onToggleAll: () => void;
   onJumpToError: () => void;
 }) {
   return (
     <div data-testid="trace-controls" className="flex items-center gap-2">
-      <Button
-        type="button"
-        variant="ghost"
-        size="xs"
-        aria-label={anyExpanded ? "Collapse all steps" : "Expand all steps"}
-        onClick={onToggleAll}
-        leadingIcon={anyExpanded ? RiContractUpDownLine : RiExpandUpDownLine}
-      >
-        {anyExpanded ? "Collapse all" : "Expand all"}
-      </Button>
+      {canToggleAll && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          aria-label={anyExpanded ? "Collapse all steps" : "Expand all steps"}
+          onClick={onToggleAll}
+          leadingIcon={anyExpanded ? RiContractUpDownLine : RiExpandUpDownLine}
+        >
+          {anyExpanded ? "Collapse all" : "Expand all"}
+        </Button>
+      )}
       {canJump && (
         <Button
           type="button"

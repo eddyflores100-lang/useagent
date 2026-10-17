@@ -26,6 +26,7 @@ import {
   anyStepExpanded,
   applyAllSteps,
   boundedErrorReveal,
+  extendRevealForward,
   TraceControlsBar,
   traceControlsModel,
 } from "@/components/chat/turn-trace-controls";
@@ -206,6 +207,9 @@ export const TraceRowView = memo(function TraceRowView({
       data-family={row.family}
       data-row-key={row.key}
       data-highlight={highlighted ? "true" : undefined}
+      // Programmatic focus target for Jump to error when the row has no button
+      // of its own (a failed step with no payload); not in tab order.
+      tabIndex={-1}
     >
       {expandable ? (
         <button
@@ -314,16 +318,20 @@ export function TurnTrace({
     [],
   );
   const baseHidden = showAll ? 0 : Math.max(0, rows.length - MAX_VISIBLE_TRACE_ROWS);
-  // The reveal window only ever widens the fold's earlier side (it never
-  // hides rows the current view already showed) and caps the later side at
-  // the window's edge; whatever stays hidden keeps its Show N steps button.
+  // After a jump the view IS the bounded reveal window: the rows before it
+  // keep their earlier-steps affordance and the rows after it keep the
+  // later-steps one, which pages forward a bounded chunk per click. Nothing
+  // widens the view past the window on its own, so one click can never mount
+  // a 10,000-row trace (or hide the rows the current view already showed:
+  // jumping inside the newest rows keeps them).
   const hidden = reveal ? Math.min(reveal.from, baseHidden) : baseHidden;
-  const revealedTo = reveal
-    ? Math.max(reveal.to, hidden + MAX_VISIBLE_TRACE_ROWS, Math.min(rows.length, baseHidden + MAX_VISIBLE_TRACE_ROWS))
-    : rows.length;
-  const laterCount = rows.length - revealedTo;
-  const visible = rows.slice(hidden, revealedTo);
+  const shownTo = reveal ? reveal.to : rows.length;
+  const laterCount = rows.length - shownTo;
+  const visible = rows.slice(hidden, shownTo);
   const controls = useMemo(() => traceControlsModel(rows), [rows]);
+  // The all-toggle acts on the rows the reader can see (the fold and any
+  // reveal window stay put), so its model is built from the visible slice.
+  const visibleControls = useMemo(() => traceControlsModel(visible), [visible]);
   const anyExpanded = anyStepExpanded(stepExpansion, controls);
   const toggleStep = useCallback(
     (key: string) => {
@@ -333,18 +341,17 @@ export function TurnTrace({
   );
   const toggleAllSteps = useCallback(() => {
     touched.current = true;
-    // Expanding also opens the trace itself, so the rows it reveals are
-    // visible, and it keeps the PR's promise that the earlier steps come out
-    // of the fold (the button reads Collapse all while any step is open; rows
-    // staying hidden behind the fold would contradict it). Collapse keeps
-    // the fold as it is.
-    if (!anyExpanded) {
-      setOpen(true);
-      setShowAll(true);
-      setReveal(null);
-    }
-    setStepExpansion((current) => applyAllSteps(current, controls, !anyExpanded));
-  }, [anyExpanded, controls, setOpen, setReveal, setShowAll, setStepExpansion]);
+    // Bounded by construction: expanding opens the payloads of the shown rows
+    // only (on a 10,000-step fold that is ~24 payload components, never
+    // 10,000), and it opens the trace itself so they are visible. The fold and
+    // any reveal window stay where they are — widening them is the reader's
+    // own next click. Collapse clears every step, hidden ones included: cheap,
+    // since nothing is mounted for them.
+    if (!anyExpanded) setOpen(true);
+    setStepExpansion((current) =>
+      applyAllSteps(current, anyExpanded ? controls : visibleControls, !anyExpanded),
+    );
+  }, [anyExpanded, controls, visibleControls, setOpen, setStepExpansion]);
   const jumpToFirstError = useCallback(() => {
     const failedKey = controls.firstFailedKey;
     if (failedKey === null) return;
@@ -364,7 +371,7 @@ export function TurnTrace({
       // unique within one turn, so a document-wide lookup scrolls to the
       // first turn's failure even when jumping from the second.
       const row = traceRef.current?.querySelector<HTMLElement>(
-        `[data-row-key="${escapeDoubleQuotes(failedKey)}"]`,
+        `[data-row-key="${CSS.escape(failedKey)}"]`,
       );
       if (!row) return;
       // Respect the reader's motion preference, and move focus to the error
@@ -375,7 +382,9 @@ export function TurnTrace({
       (row.querySelector<HTMLElement>("button") ?? row).focus?.({ preventScroll: true });
     });
   }, [controls, rows, showAll, setOpen, setStepExpansion]);
-  const showControls = controls.expandableKeys.length > 0 || controls.firstFailedKey !== null;
+  const canToggleAll = controls.expandableKeys.length > 0;
+  const canJump = controls.firstFailedKey !== null;
+  const showControls = canToggleAll || canJump;
 
   return (
     <section
@@ -398,7 +407,8 @@ export function TurnTrace({
         {showControls && (
           <TraceControlsBar
             anyExpanded={anyExpanded}
-            canJump={controls.firstFailedKey !== null}
+            canToggleAll={canToggleAll}
+            canJump={canJump}
             onToggleAll={toggleAllSteps}
             onJumpToError={jumpToFirstError}
           />
@@ -431,7 +441,11 @@ export function TurnTrace({
         {laterCount > 0 && (
           <button
             type="button"
-            onClick={() => setReveal({ from: hidden, to: rows.length })}
+            onClick={() =>
+              setReveal((current) =>
+                extendRevealForward(current ?? { from: hidden, to: shownTo }, rows.length),
+              )
+            }
             className="flex min-h-7 w-fit items-center rounded-md px-1.5 py-0.5 text-[12px] text-text-tertiary transition-colors hover:bg-background-primary-hover hover:text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-border-focus-ring"
           >
             Show {laterCount} later {laterCount === 1 ? "step" : "steps"}
@@ -441,8 +455,4 @@ export function TurnTrace({
       </Thinking>
     </section>
   );
-}
-
-function escapeDoubleQuotes(value: string): string {
-  return value.replace(/[\\"]/g, "\\$&");
 }
